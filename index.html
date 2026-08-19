@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#10151C">
+<title>ΝΟΥΣ — Personal Assistant</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.png">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=GFS+Didot&family=Source+Sans+3:wght@400;600;700&display=swap');
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; min-height:100vh; background:#10151C; color:#E6EAF0;
+         font-family:'Source Sans 3','Noto Sans',system-ui,sans-serif; }
+  .display { font-family:'GFS Didot','Georgia',serif; }
+  header { background:#0B0F14; padding:calc(14px + env(safe-area-inset-top)) 16px 12px;
+           border-bottom:1px solid #232D3A; }
+  .hrow { max-width:720px; margin:0 auto; display:flex; justify-content:space-between; align-items:baseline; }
+  .shell { max-width:720px; margin:0 auto; padding:0 14px calc(90px + env(safe-area-inset-bottom)); }
+  .tabs { max-width:720px; margin:0 auto; display:flex; gap:6px; padding:12px 14px 2px; flex-wrap:wrap; }
+  .chip { padding:8px 13px; border-radius:999px; border:1.5px solid #2C3948; background:transparent;
+          color:#9FB0C3; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; font-family:inherit; }
+  .chip.on { border-color:#E8B84B; background:#E8B84B; color:#10151C; }
+  .btn { padding:11px 18px; border-radius:10px; border:none; background:#E8B84B; color:#10151C;
+         font-weight:700; font-size:14px; cursor:pointer; font-family:inherit; }
+  .btn.sec { background:transparent; border:1.5px solid #E8B84B; color:#E8B84B; }
+  .btn.ghost { background:transparent; border:1.5px solid #2C3948; color:#9FB0C3; }
+  .btn:disabled { opacity:.45; }
+  .card { background:#1A222C; border-radius:14px; padding:16px; margin-top:12px;
+          border:1px solid #232D3A; }
+  .muted { font-size:12.5px; color:#7A8A9D; }
+  .lbl { font-size:12px; color:#7A8A9D; letter-spacing:.05em; text-transform:uppercase; margin-bottom:4px; }
+  input[type=text], input[type=password], textarea, select {
+    width:100%; padding:11px; border-radius:10px; border:1.5px solid #2C3948; font-size:15px;
+    font-family:inherit; background:#0F141B; color:#E6EAF0; }
+  textarea { min-height:70px; resize:vertical; }
+  .msg { margin-top:10px; display:flex; }
+  .msg.user { justify-content:flex-end; }
+  .bubble { max-width:86%; padding:11px 14px; border-radius:14px; font-size:15px; line-height:1.5; white-space:pre-wrap; }
+  .user .bubble { background:#E8B84B; color:#10151C; border-bottom-right-radius:4px; }
+  .ai .bubble { background:#1A222C; border:1px solid #232D3A; border-bottom-left-radius:4px; }
+  .ai .meta { font-size:11px; color:#5E6E80; margin-top:4px; }
+  .chatbar { position:fixed; left:0; right:0; bottom:0; background:#0B0F14; border-top:1px solid #232D3A;
+             padding:10px 14px calc(10px + env(safe-area-inset-bottom)); }
+  .chatrow { max-width:720px; margin:0 auto; display:flex; gap:8px; }
+  .chatrow input { flex:1; }
+  .fact { padding:12px 14px; border-radius:10px; background:#141B24; border:1px solid #232D3A; margin-top:8px; }
+  .tag { display:inline-block; font-size:10.5px; font-weight:700; padding:2px 7px; border-radius:999px;
+         letter-spacing:.05em; margin-right:6px; }
+  .tag.identity  { background:#2A3A52; color:#8FB4E8; }
+  .tag.ambient   { background:#2A4238; color:#8FE0B0; }
+  .tag.interest  { background:#453354; color:#C99FE8; }
+  .tag.episodic  { background:#4A3A28; color:#E8C48F; }
+  .tag.procedure { background:#4A2A34; color:#E89FB4; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .status { font-size:12.5px; color:#E8B84B; margin-top:8px; min-height:16px; }
+  .prog { height:6px; background:#232D3A; border-radius:3px; overflow:hidden; margin-top:6px; }
+  .prog > div { height:100%; background:#E8B84B; width:0%; transition:width .3s; }
+  a { color:#E8B84B; }
+  .gap { border-left:3px solid #E89FB4; padding-left:10px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="hrow">
+    <div>
+      <div class="display" style="font-size:26px; letter-spacing:.14em; color:#E8B84B;">ΝΟΥΣ</div>
+      <div style="font-size:11px; color:#7A8A9D; letter-spacing:.08em;" id="hdrStatus">PERSONAL ASSISTANT</div>
+    </div>
+    <div style="text-align:right; font-size:12.5px; line-height:1.5; color:#9FB0C3;">
+      <div><b style="color:#E8B84B" id="statFacts">0</b> facts stored</div>
+      <div id="statNet">—</div>
+    </div>
+  </div>
+</header>
+<div class="tabs" id="tabs"></div>
+<div class="shell" id="main"></div>
+<div class="chatbar" id="chatbar" style="display:none;">
+  <div class="chatrow">
+    <input type="text" id="chatIn" placeholder="Ask me anything…" autocomplete="off">
+    <button class="btn" id="sendBtn" onclick="sendMsg()">Send</button>
+  </div>
+</div>
+
+<script type="module">
+"use strict";
+// ════════════════════════════════════════════════════════════════
+// ΝΟΥΣ — offline-first personal assistant
+// Online: Claude builds the knowledge base (atomic facts + embeddings)
+// Offline: local retrieval + context manager + WebLLM (~1.5B) voice
+// ════════════════════════════════════════════════════════════════
+const APP_VERSION = "v1";
+const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
+             gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect" };
+
+const WEBLLM_MODELS = [
+  { id:"Qwen2.5-1.5B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 1.5B (default, ~950MB)" },
+  { id:"Llama-3.2-1B-Instruct-q4f16_1-MLC", label:"Llama 3.2 1B (lighter, ~700MB)" },
+  { id:"Qwen2.5-0.5B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 0.5B (smallest, ~400MB)" },
+  { id:"Qwen2.5-3B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 3B (~1.9GB — flagship phones only)" },
+];
+const EMBED_MODEL = "Xenova/all-MiniLM-L6-v2";
+const SIM_THRESHOLD = 0.30;      // below this, retrieval counts as a gap
+const TOKEN_BUDGET = 2800;       // approx tokens for assembled offline prompt
+const approxTok = s => Math.ceil((s||"").length / 4);
+
+// ── storage ──
+function load(k, fb){ try{ const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; }catch(e){ return fb; } }
+function save(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){ console.error("save", e); alert("Storage full — export & prune your knowledge base."); } }
+
+let facts    = load(LS.facts, []);
+let profile  = load(LS.profile, { text:"", name:"", location:"" });
+let sessions = load(LS.sessions, []);
+let gaps     = load(LS.gaps, []);
+let settings = load(LS.settings, { apiKey:"", claudeModel:"claude-sonnet-4-6",
+                 webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, route:"auto" });
+let reflect  = load(LS.reflect, { lastRun:0, proposals:[] });
+
+let tab = "chat";
+let session = { id:Date.now(), started:Date.now(), turns:[] };
+sessions.push(session); if(sessions.length>20) sessions = sessions.slice(-20); save(LS.sessions, sessions);
+
+let busy = false;
+let engine = null, engineModel = null, engineLoading = false;
+let embedPipe = null, embedLoading = false;
+
+// ── embeddings (Transformers.js, WASM — works with or without WebGPU) ──
+async function getEmbedder(status){
+  if(embedPipe) return embedPipe;
+  if(embedLoading) throw new Error("Embedder still loading");
+  embedLoading = true;
+  try{
+    if(status) status("Loading embedding model (~25MB, first time only)…");
+    const T = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.1/dist/transformers.min.js");
+    embedPipe = await T.pipeline("feature-extraction", EMBED_MODEL, { dtype:"q8" });
+    return embedPipe;
+  } finally { embedLoading = false; }
+}
+async function embedText(text, status){
+  const pipe = await getEmbedder(status);
+  const out = await pipe(text, { pooling:"mean", normalize:true });
+  return Array.from(out.data); // Float32 -> plain array (384 dims, unit norm)
+}
+// int8 quantize <-> base64 for compact localStorage
+function encVec(v){ const a = new Int8Array(v.length); for(let i=0;i<v.length;i++) a[i]=Math.max(-127,Math.min(127,Math.round(v[i]*127)));
+  let s=""; const b=new Uint8Array(a.buffer); for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]); return btoa(s); }
+function decVec(b64){ const s=atob(b64); const b=new Uint8Array(s.length); for(let i=0;i<s.length;i++) b[i]=s.charCodeAt(i);
+  const a=new Int8Array(b.buffer); const v=new Float32Array(a.length); for(let i=0;i<a.length;i++) v[i]=a[i]/127; return v; }
+function cosine(q, b64){ const f = decVec(b64); let d=0, nq=0, nf=0;
+  for(let i=0;i<q.length;i++){ d+=q[i]*f[i]; nq+=q[i]*q[i]; nf+=f[i]*f[i]; }
+  return d / (Math.sqrt(nq)*Math.sqrt(nf) || 1); }
+
+// ── Claude API (BYO key) ──
+async function claude(messages, opts={}){
+  const body = { model: settings.claudeModel, max_tokens: opts.maxTokens||3000, messages };
+  if(opts.system) body.system = opts.system;
+  if(opts.webSearch) body.tools = [{ type:"web_search_20250305", name:"web_search" }];
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers:{ "content-type":"application/json", "x-api-key":settings.apiKey,
+      "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" },
+    body: JSON.stringify(body)
+  });
+  if(!res.ok){ const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message || "HTTP "+res.status); }
+  const data = await res.json();
+  return data.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
+}
+function parseJSON(raw){
+  const clean = raw.replace(/```json|```/g,"").trim();
+  const start = Math.min(...[clean.indexOf("{"), clean.indexOf("[")].filter(i=>i>=0));
+  return JSON.parse(clean.slice(start));
+}
+
+// ── fact store ──
+async function addFacts(cards, source, status){
+  let added = 0;
+  for(const c of cards){
+    if(!c.text) continue;
+    if(facts.find(f => f.text.toLowerCase() === c.text.trim().toLowerCase())) continue; // dedupe
+    if(status) status(`Embedding ${added+1}/${cards.length}…`);
+    const vec = await embedText(c.text, status);
+    facts.push({ id:Date.now()+Math.random(), text:c.text.trim(),
+      category:["identity","ambient","interest","episodic","procedure"].includes(c.category)?c.category:"episodic",
+      aliases:Array.isArray(c.aliases)?c.aliases.slice(0,8):[],
+      source, confidence:c.confidence||"medium",
+      created:Date.now(), verified:Date.now(), emb:encVec(vec) });
+    added++;
+  }
+  save(LS.facts, facts);
+  return added;
+}
+function ageOf(f){ const d = Math.floor((Date.now()-(f.verified||f.created))/86400000);
+  return d<1?"today":d<30?d+"d ago":Math.floor(d/30)+"mo ago"; }
+
+// ── retrieval ──
+async function retrieve(query, k=6, status){
+  if(facts.length===0) return { hits:[], best:0 };
+  // alias expansion: append alias words whose trigger appears in the query
+  let expanded = query;
+  const ql = query.toLowerCase();
+  const extra = new Set();
+  for(const f of facts) for(const a of (f.aliases||[]))
+    if(ql.includes(a.toLowerCase())) (f.aliases||[]).forEach(x=>extra.add(x));
+  if(extra.size) expanded += " " + [...extra].slice(0,10).join(" ");
+  const q = await embedText(expanded, status);
+  const scored = facts.map(f=>({ f, s: cosine(q, f.emb) })).sort((a,b)=>b.s-a.s);
+  const hits = scored.slice(0, k).filter(x=>x.s >= SIM_THRESHOLD);
+  return { hits, best: scored[0]?.s || 0 };
+}
+
+// ── context manager (the star): fill a fixed budget by priority ──
+function assembleOffline(question, hits){
+  let budget = TOKEN_BUDGET - 350;               // reserve for the answer
+  const parts = [];
+  // 1. profile (frozen, always in)
+  const today = new Date().toDateString();
+  let sys = `You are ΝΟΥΣ, a personal assistant. Today is ${today}. Be concise, warm, direct. `+
+            `Answer ONLY from the profile and stored facts below plus the conversation. `+
+            `If they don't contain the answer, say plainly you don't have that stored (it will be researched later) — never invent facts.`;
+  if(profile.text) sys += `\n\nUSER PROFILE:\n${profile.text}`;
+  budget -= approxTok(sys);
+  // 2. retrieved facts (with age so the model can hedge)
+  if(hits.length){
+    let fx = "\n\nSTORED FACTS (with age):";
+    for(const {f} of hits){
+      const line = `\n- [${f.category}, ${ageOf(f)}] ${f.text}`;
+      if(approxTok(fx+line) > budget*0.6) break;   // facts may take up to ~60% of what's left
+      fx += line;
+    }
+    sys += fx; budget -= approxTok(fx);
+  } else {
+    sys += "\n\nSTORED FACTS: none relevant to this question.";
+  }
+  // 3. session history (recent verbatim, oldest dropped first)
+  const msgs = [];
+  const hist = session.turns.slice(-8);
+  let used = approxTok(question);
+  for(let i=hist.length-1; i>=0; i--){
+    const t = approxTok(hist[i].text);
+    if(used + t > budget) break;
+    msgs.unshift({ role: hist[i].role==="user"?"user":"assistant", content: hist[i].text });
+    used += t;
+  }
+  msgs.push({ role:"user", content: question });
+  return { system: sys, messages: msgs };
+}
+
+// ── WebLLM ──
+function webgpuOK(){ return !!navigator.gpu; }
+async function getEngine(status){
+  if(engine && engineModel===settings.webllmModel) return engine;
+  if(engineLoading) throw new Error("Model still loading");
+  engineLoading = true;
+  try{
+    if(status) status("Loading chat model — first time downloads weights…");
+    const { CreateMLCEngine } = await import("https://esm.run/@mlc-ai/web-llm");
+    engine = await CreateMLCEngine(settings.webllmModel, {
+      initProgressCallback: p => { if(status) status(p.text||"loading…", p.progress); }
+    });
+    engineModel = settings.webllmModel;
+    return engine;
+  } finally { engineLoading = false; }
+}
+async function localGenerate(system, messages, status){
+  const eng = await getEngine(status);
+  const r = await eng.chat.completions.create({
+    messages: [{ role:"system", content: system }, ...messages],
+    temperature: 0.6, max_tokens: 300 });
+  return r.choices[0].message.content.trim();
+}
+
+// ── TTS ──
+function speak(text){
+  if(!settings.tts) return;
+  try{ speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = settings.ttsRate || 1.0;
+    speechSynthesis.speak(u);
+  }catch(e){}
+}
+
+// ── chat send: route online (Claude) / offline (retrieval + WebLLM) ──
+async function sendMsg(){
+  const inp = document.getElementById("chatIn");
+  const q = inp.value.trim();
+  if(!q || busy) return;
+  inp.value = ""; busy = true;
+  session.turns.push({ role:"user", text:q, ts:Date.now() });
+  save(LS.sessions, sessions);
+  render();
+  const online = navigator.onLine && settings.apiKey && settings.route!=="offline";
+  try{
+    let reply, via;
+    const { hits, best } = await retrieve(q, 6, setChatStatus);
+    if(online){
+      via = "claude · online";
+      let sys = `You are ΝΟΥΣ, the user's personal assistant. Be concise, warm, direct. Today is ${new Date().toDateString()}.`;
+      if(profile.text) sys += `\nUSER PROFILE:\n${profile.text}`;
+      if(hits.length) sys += `\nSTORED FACTS:\n${hits.map(h=>"- "+h.f.text).join("\n")}`;
+      const msgs = session.turns.slice(-10).map(t=>({ role:t.role==="user"?"user":"assistant", content:t.text }));
+      reply = await claude(msgs, { system: sys, maxTokens: 700 });
+    } else {
+      if(!webgpuOK()) throw new Error("Offline chat needs WebGPU (iOS 26+ Safari). Connect online or update iOS.");
+      via = `local · ${hits.length} facts`;
+      if(!hits.length){
+        gaps.push({ q, ts:Date.now() }); save(LS.gaps, gaps);
+        via = "local · gap logged";
+      }
+      const { system, messages } = assembleOffline(q, hits);
+      setChatStatus("thinking…");
+      reply = await localGenerate(system, messages, setChatStatus);
+    }
+    session.turns.push({ role:"ai", text:reply, via, ts:Date.now() });
+    save(LS.sessions, sessions);
+    speak(reply);
+  }catch(e){
+    session.turns.push({ role:"ai", text:"⚠ "+e.message, via:"error", ts:Date.now() });
+    save(LS.sessions, sessions);
+  }
+  busy = false; setChatStatus(""); render();
+}
+function setChatStatus(t, p){
+  const el = document.getElementById("chatStatus");
+  if(el){ el.textContent = t||""; }
+  const bar = document.getElementById("chatProg");
+  if(bar){ bar.style.display = (p!==undefined && p<1) ? "block" : "none";
+    if(p!==undefined) bar.firstElementChild.style.width = Math.round(p*100)+"%"; }
+}
+
+// ── builder: onboarding ──
+const DECOMPOSE_RULES = `Decompose into ATOMIC facts: one self-contained idea each, meaningful out of context, short.
+Return ONLY JSON: {"profile":"a 60-120 word standing profile paragraph (who they are, where, key context)",
+"facts":[{"text":"...","category":"identity|ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low"}]}`;
+
+async function runOnboard(){
+  if(!settings.apiKey){ setBuildStatus("Add your Anthropic API key in Settings first."); return; }
+  const g = id=>document.getElementById(id).value.trim();
+  const info = { name:g("obName"), home:g("obHome"), now:g("obNow"), work:g("obWork"),
+                 interests:g("obInterests"), extra:g("obExtra") };
+  if(!info.name){ setBuildStatus("At least give me a name to work with."); return; }
+  busy = true; setBuildStatus("Claude is building your knowledge base…");
+  try{
+    const prompt = `A user is onboarding their personal assistant. Their info:
+Name: ${info.name}\nHome: ${info.home}\nCurrent location: ${info.now}\nWork/projects: ${info.work}\nInterests: ${info.interests}\nOther details: ${info.extra}
+
+For the ambient layer, use web search to also add ~10 practical facts about their current location (emergency number, main hospital, timezone, climate now, key local practicalities).
+${DECOMPOSE_RULES}`;
+    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:4000 });
+    const out = parseJSON(raw);
+    profile.text = out.profile || profile.text;
+    profile.name = info.name; profile.location = info.now || info.home;
+    save(LS.profile, profile);
+    const n = await addFacts(out.facts||[], "onboarding", setBuildStatus);
+    setBuildStatus(`Done — profile set, ${n} facts stored.`);
+  }catch(e){ setBuildStatus("Failed: "+e.message); }
+  busy = false; render();
+}
+
+// ── builder: learn a topic ──
+async function learnTopic(){
+  if(!settings.apiKey){ setBuildStatus("Add your Anthropic API key in Settings first."); return; }
+  const topic = document.getElementById("topicIn").value.trim();
+  if(!topic) return;
+  busy = true; setBuildStatus(`Researching "${topic}"…`);
+  try{
+    const prompt = `Research this topic for a user's offline knowledge base: "${topic}".
+User profile for context: ${profile.text||"(none)"}
+Use web search for anything current. Be anticipatory: cover the adjacent sub-questions they'll likely ask, not just the literal topic. Aim for 15-30 facts.
+Return ONLY JSON: {"facts":[{"text":"...","category":"ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low"}]}`;
+    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:4000 });
+    const out = parseJSON(raw);
+    const n = await addFacts(out.facts||[], "research", setBuildStatus);
+    setBuildStatus(`Stored ${n} facts on "${topic}" — available offline now.`);
+    document.getElementById("topicIn").value = "";
+  }catch(e){ setBuildStatus("Failed: "+e.message); }
+  busy = false; render();
+}
+function setBuildStatus(t){ const el=document.getElementById("buildStatus"); if(el) el.textContent=t; }
+
+// ── reflection ──
+async function runReflection(){
+  if(!settings.apiKey){ alert("Add your API key in Settings first."); return; }
+  busy = true; renderTab();
+  try{
+    const recent = sessions.slice(-6).map(s =>
+      s.turns.map(t=>`${t.role}: ${t.text}`).join("\n")).join("\n---\n").slice(-12000);
+    const gapList = gaps.slice(-30).map(g=>g.q).join("\n");
+    const prompt = `You are the reflection pass of a personal assistant. Analyze recent conversations and offline knowledge gaps.
+
+RECENT CONVERSATIONS:\n${recent||"(none)"}\n\nOFFLINE GAPS (questions we had no stored answer for):\n${gapList||"(none)"}
+
+Tasks: 1) Find topics recurring across MULTIPLE sessions (ignore one-offs). 2) Cross-reference with gaps. 3) For each recurring theme or gap, use web search if needed and propose NEW atomic facts (or step-by-step "procedure" facts) that would help the assistant next time. 4) If the user's situation changed, propose an updated profile paragraph.
+
+Return ONLY JSON: {"themes":["..."],"updatedProfile":"string or null",
+"proposals":[{"text":"...","category":"ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low","reason":"why this helps"}]}`;
+    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:4000 });
+    const out = parseJSON(raw);
+    reflect = { lastRun: Date.now(), themes: out.themes||[],
+                updatedProfile: out.updatedProfile||null,
+                proposals: (out.proposals||[]).map(p=>({ ...p, id:Date.now()+Math.random() })) };
+    save(LS.reflect, reflect);
+  }catch(e){ alert("Reflection failed: "+e.message); }
+  busy = false; renderTab();
+}
+async function approveProposal(id){
+  const p = reflect.proposals.find(x=>x.id===id); if(!p) return;
+  busy = true; renderTab();
+  await addFacts([p], "reflection");
+  reflect.proposals = reflect.proposals.filter(x=>x.id!==id);
+  save(LS.reflect, reflect);
+  gaps = []; save(LS.gaps, gaps);
+  busy = false; renderTab();
+}
+function rejectProposal(id){
+  reflect.proposals = reflect.proposals.filter(x=>x.id!==id);
+  save(LS.reflect, reflect); renderTab();
+}
+function acceptProfile(){
+  if(reflect.updatedProfile){ profile.text = reflect.updatedProfile; save(LS.profile, profile);
+    reflect.updatedProfile = null; save(LS.reflect, reflect); renderTab(); }
+}
+
+// ── models preload (Settings) ──
+async function initModels(){
+  busy = true;
+  const status = (t,p)=>{ const el=document.getElementById("modelStatus"); if(el) el.textContent=t;
+    const bar=document.getElementById("modelProg");
+    if(bar){ bar.style.display="block"; if(p!==undefined) bar.firstElementChild.style.width=Math.round(p*100)+"%"; } };
+  try{
+    await getEmbedder(status);
+    status("Embedding model ready ✓");
+    if(webgpuOK()){ await getEngine(status); status("All models ready ✓ — offline chat is live."); }
+    else status("Embedding ready ✓ — but no WebGPU on this browser, so offline chat is unavailable (retrieval + online chat still work).");
+  }catch(e){ status("Failed: "+e.message); }
+  busy = false;
+}
+
+// ── export / import ──
+function exportAll(){
+  const blob = new Blob([JSON.stringify({ facts, profile, sessions, gaps, reflect }, null, 1)], { type:"application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = "nous-backup.json"; a.click();
+}
+function importAll(ev){
+  const file = ev.target.files[0]; if(!file) return;
+  const r = new FileReader();
+  r.onload = () => { try{
+    const d = JSON.parse(r.result);
+    if(d.facts){ facts = d.facts; save(LS.facts, facts); }
+    if(d.profile){ profile = d.profile; save(LS.profile, profile); }
+    alert("Imported ✓"); render();
+  }catch(e){ alert("Import failed: "+e.message); } };
+  r.readAsText(file);
+}
+function deleteFact(id){ facts = facts.filter(f=>f.id!==id); save(LS.facts, facts); renderTab(); }
+
+// ── rendering ──
+const $ = id => document.getElementById(id);
+function esc(s){ return String(s??"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function render(){
+  $("statFacts").textContent = facts.length;
+  $("statNet").textContent = (navigator.onLine ? (settings.apiKey?"online · claude ready":"online · no key") : "offline · local") + " · " + APP_VERSION;
+  $("tabs").innerHTML = [["chat","Chat"],["know","Knowledge"],["build","Build"],
+    ["reflect",`Reflect${reflect.proposals.length?` (${reflect.proposals.length})`:""}`],["set","⚙"]]
+    .map(([id,l])=>`<button class="chip${tab===id?" on":""}" onclick="setTab('${id}')">${l}</button>`).join("");
+  $("chatbar").style.display = tab==="chat" ? "block" : "none";
+  renderTab();
+}
+
+function renderTab(){
+  let h = "";
+  if(tab==="chat"){
+    if(session.turns.length===0){
+      h += `<div class="card"><div class="display" style="font-size:19px;color:#E8B84B;">${profile.name?`Γεια σου, ${esc(profile.name)}.`:"Welcome."}</div>
+        <div class="muted" style="margin-top:6px;">${facts.length ? `${facts.length} facts in memory. Online I answer with Claude; offline I answer from what we've stored.` :
+        "The knowledge base is empty — visit <b>Build</b> to onboard me, then <b>⚙</b> to download the offline models."}</div></div>`;
+    }
+    for(const t of session.turns){
+      h += `<div class="msg ${t.role==="user"?"user":"ai"}"><div>
+        <div class="bubble">${esc(t.text)}</div>
+        ${t.via?`<div class="meta">${esc(t.via)}</div>`:""}</div></div>`;
+    }
+    h += `<div class="status" id="chatStatus"></div><div class="prog" id="chatProg" style="display:none;"><div></div></div>`;
+    if(busy) h += `<div class="muted">…</div>`;
+  }
+
+  if(tab==="know"){
+    h += `<div class="card"><div class="row">
+      <input type="text" id="knowFilter" placeholder="Filter facts…" oninput="renderTab()" style="flex:1;">
+      </div>
+      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+        <button class="btn ghost" onclick="exportAll()">Export backup</button>
+        <label class="btn ghost" style="display:inline-block;">Import<input type="file" accept=".json" style="display:none;" onchange="importAll(event)"></label>
+      </div></div>`;
+    if(profile.text) h += `<div class="card"><div class="lbl">Standing profile (in every offline prompt)</div>
+      <div style="font-size:14px;line-height:1.55;">${esc(profile.text)}</div></div>`;
+    const filt = ($("knowFilter")?.value||"").toLowerCase();
+    const list = facts.filter(f=>!filt || f.text.toLowerCase().includes(filt) || f.category.includes(filt));
+    h += `<div class="muted" style="margin-top:12px;">${list.length} of ${facts.length} facts</div>`;
+    for(const f of [...list].sort((a,b)=>b.created-a.created).slice(0,200)){
+      h += `<div class="fact"><div class="row"><div style="min-width:0;">
+        <span class="tag ${f.category}">${f.category}</span><span class="muted">${ageOf(f)} · ${esc(f.source)}</span>
+        <div style="margin-top:5px;font-size:14.5px;line-height:1.5;">${esc(f.text)}</div></div>
+        <button style="background:none;border:none;color:#E89FB4;font-size:15px;cursor:pointer;flex-shrink:0;" onclick="deleteFact(${f.id})">✕</button>
+      </div></div>`;
+    }
+  }
+
+  if(tab==="build"){
+    h += `<div class="card"><div class="display" style="font-size:18px;color:#E8B84B;">Onboarding</div>
+      <div class="muted" style="margin:4px 0 10px;">Claude interviews this form, researches your location, and builds the initial knowledge base. Run once (re-running adds more).</div>
+      <div class="lbl">Name</div><input type="text" id="obName" value="${esc(profile.name)}">
+      <div class="lbl" style="margin-top:8px;">Home base</div><input type="text" id="obHome" placeholder="e.g. Sherwood Park, Alberta">
+      <div class="lbl" style="margin-top:8px;">Current location</div><input type="text" id="obNow" placeholder="Where are you right now / next?">
+      <div class="lbl" style="margin-top:8px;">Work & projects</div><textarea id="obWork" placeholder="What you do, what you're building…"></textarea>
+      <div class="lbl" style="margin-top:8px;">Interests</div><input type="text" id="obInterests" placeholder="comma separated">
+      <div class="lbl" style="margin-top:8px;">Anything else I should know</div><textarea id="obExtra"></textarea>
+      <button class="btn" style="margin-top:12px;width:100%;" onclick="runOnboard()" ${busy?"disabled":""}>Build my knowledge base</button>
+    </div>
+    <div class="card"><div class="display" style="font-size:18px;color:#E8B84B;">Learn a topic for offline</div>
+      <div class="muted" style="margin:4px 0 10px;">e.g. "my trip to Porto Cheli next week", "TOPENS AD5 gate opener troubleshooting", "raising turkeys in Alberta winters".</div>
+      <div style="display:flex;gap:8px;"><input type="text" id="topicIn" placeholder="Topic…" style="flex:1;">
+      <button class="btn" onclick="learnTopic()" ${busy?"disabled":""}>Go</button></div>
+    </div>
+    <div class="status" id="buildStatus"></div>`;
+  }
+
+  if(tab==="reflect"){
+    h += `<div class="card"><div class="row">
+      <div><div class="display" style="font-size:18px;color:#E8B84B;">Reflection</div>
+      <div class="muted">Analyzes recent chats + offline gaps; proposes new knowledge. You approve.</div>
+      <div class="muted" style="margin-top:4px;">Last run: ${reflect.lastRun?new Date(reflect.lastRun).toLocaleString():"never"} · ${gaps.length} open gaps</div></div>
+      <button class="btn" onclick="runReflection()" ${busy?"disabled":""}>${busy?"…":"Run now"}</button></div></div>`;
+    if(gaps.length){
+      h += `<div class="card"><div class="lbl">Offline gaps logged</div>`;
+      for(const g of gaps.slice(-10)) h += `<div class="gap" style="margin-top:8px;font-size:14px;">${esc(g.q)}</div>`;
+      h += `</div>`;
+    }
+    if(reflect.themes?.length) h += `<div class="card"><div class="lbl">Detected themes</div>
+      <div style="font-size:14px;margin-top:6px;">${reflect.themes.map(esc).join(" · ")}</div></div>`;
+    if(reflect.updatedProfile) h += `<div class="card"><div class="lbl">Proposed profile update</div>
+      <div style="font-size:14px;line-height:1.5;margin-top:6px;">${esc(reflect.updatedProfile)}</div>
+      <button class="btn" style="margin-top:10px;" onclick="acceptProfile()">Accept</button></div>`;
+    for(const p of reflect.proposals){
+      h += `<div class="fact"><span class="tag ${p.category}">${p.category}</span>
+        <div style="margin-top:5px;font-size:14.5px;">${esc(p.text)}</div>
+        <div class="muted" style="margin-top:4px;">${esc(p.reason||"")}</div>
+        <div style="display:flex;gap:6px;margin-top:8px;">
+          <button class="btn" style="padding:7px 14px;font-size:13px;" onclick="approveProposal(${p.id})">Keep</button>
+          <button class="btn ghost" style="padding:7px 14px;font-size:13px;" onclick="rejectProposal(${p.id})">Discard</button>
+        </div></div>`;
+    }
+  }
+
+  if(tab==="set"){
+    h += `<div class="card"><div class="lbl">Anthropic API key (online brain)</div>
+      <input type="password" id="setKey" value="${esc(settings.apiKey)}" placeholder="sk-ant-…">
+      <div class="lbl" style="margin-top:10px;">Routing</div>
+      <select id="setRoute">
+        <option value="auto" ${settings.route==="auto"?"selected":""}>Auto — Claude online, local offline</option>
+        <option value="offline" ${settings.route==="offline"?"selected":""}>Always local (test offline mode)</option>
+      </select>
+      <button class="btn" style="margin-top:12px;width:100%;" onclick="saveSettings()">Save</button>
+    </div>
+    <div class="card"><div class="lbl">Offline chat model (WebLLM)</div>
+      <select id="setModel">${WEBLLM_MODELS.map(m=>`<option value="${m.id}" ${settings.webllmModel===m.id?"selected":""}>${m.label}</option>`).join("")}</select>
+      <button class="btn sec" style="margin-top:12px;width:100%;" onclick="initModels()" ${busy?"disabled":""}>Download & initialize models</button>
+      <div class="status" id="modelStatus">${webgpuOK()?"WebGPU available ✓":"⚠ No WebGPU in this browser — offline chat unavailable (needs iOS 26+ Safari or Chrome)"}</div>
+      <div class="prog" id="modelProg" style="display:none;"><div></div></div>
+      <div class="muted" style="margin-top:8px;">First download runs once and is cached for offline. Do it on wifi.</div>
+    </div>
+    <div class="card"><div class="lbl">Voice</div>
+      <div class="row"><span style="font-size:14.5px;">Read replies aloud (TTS)</span>
+      <button class="chip ${settings.tts?"on":""}" onclick="toggleTTS()">${settings.tts?"On":"Off"}</button></div>
+      <div class="lbl" style="margin-top:10px;">Speed</div>
+      <select id="setRate">${[["0.8","Slow"],["1.0","Normal"],["1.2","Fast"]].map(([v,l])=>`<option value="${v}" ${String(settings.ttsRate)===v?"selected":""}>${l}</option>`).join("")}</select>
+    </div>
+    <div class="card"><div class="lbl">Data</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="btn ghost" onclick="exportAll()">Export everything</button>
+        <button class="btn ghost" onclick="clearChat()">New chat session</button>
+      </div>
+      <div class="muted" style="margin-top:8px;">${facts.length} facts · ${sessions.length} sessions · ${APP_VERSION}</div>
+    </div>`;
+  }
+  $("main").innerHTML = h;
+}
+
+// ── window actions ──
+window.setTab = t => { tab = t; render(); };
+window.sendMsg = sendMsg;
+window.runOnboard = runOnboard;
+window.learnTopic = learnTopic;
+window.runReflection = runReflection;
+window.approveProposal = approveProposal;
+window.rejectProposal = rejectProposal;
+window.acceptProfile = acceptProfile;
+window.initModels = initModels;
+window.exportAll = exportAll;
+window.importAll = importAll;
+window.deleteFact = deleteFact;
+window.renderTab = renderTab;
+window.saveSettings = () => {
+  settings.apiKey = $("setKey").value.trim();
+  settings.route = $("setRoute").value;
+  settings.webllmModel = $("setModel") ? $("setModel").value : settings.webllmModel;
+  settings.ttsRate = parseFloat($("setRate")?.value||"1.0");
+  save(LS.settings, settings);
+  const el = $("modelStatus"); if(el) el.textContent = "Saved ✓";
+  render();
+};
+window.toggleTTS = () => { settings.tts = !settings.tts; save(LS.settings, settings); renderTab(); };
+window.clearChat = () => { session = { id:Date.now(), started:Date.now(), turns:[] };
+  sessions.push(session); if(sessions.length>20) sessions = sessions.slice(-20);
+  save(LS.sessions, sessions); tab="chat"; render(); };
+
+document.getElementById("chatIn").addEventListener("keydown", e => { if(e.key==="Enter") sendMsg(); });
+window.addEventListener("online", render);
+window.addEventListener("offline", render);
+if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
+
+// nightly reflection nudge: if online, key set, >24h since last run and there are gaps/chats
+if(navigator.onLine && settings.apiKey && Date.now()-reflect.lastRun > 86400000 &&
+   (gaps.length>2 || sessions.length>3)){
+  setTimeout(()=>{ if(tab==="chat" && session.turns.length===0){
+    session.turns.push({ role:"ai", via:"reflection nudge",
+      text:"It's been a while since I reflected on our conversations — open the Reflect tab and I'll propose what to learn next.", ts:Date.now() });
+    render(); } }, 1500);
+}
+
+render();
+</script>
+</body>
+</html>

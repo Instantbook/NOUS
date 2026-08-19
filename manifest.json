@@ -1,0 +1,9 @@
+{
+  "name": "ΝΟΥΣ — Personal Assistant",
+  "short_name": "NOUS",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#10151C",
+  "theme_color": "#10151C",
+  "icons": [{ "src": "icon.png", "sizes": "512x512", "type": "image/png" }]
+}
