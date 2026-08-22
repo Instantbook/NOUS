@@ -91,9 +91,9 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v1";
+const APP_VERSION = "v2";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
-             gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect" };
+             gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
 const WEBLLM_MODELS = [
   { id:"Qwen2.5-1.5B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 1.5B (default, ~950MB)" },
@@ -115,8 +115,15 @@ let profile  = load(LS.profile, { text:"", name:"", location:"" });
 let sessions = load(LS.sessions, []);
 let gaps     = load(LS.gaps, []);
 let settings = load(LS.settings, { apiKey:"", claudeModel:"claude-sonnet-4-6",
-                 webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, route:"auto" });
+                 planModel:"claude-haiku-4-5-20251001",
+                 webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, route:"auto",
+                 proxyUrl:"https://curly-term-5539.dbazos1.workers.dev/", researchDepth:2 });
+if(!settings.proxyUrl) settings.proxyUrl = "https://curly-term-5539.dbazos1.workers.dev/";
+if(!settings.planModel) settings.planModel = "claude-haiku-4-5-20251001";
+if(settings.researchDepth===undefined) settings.researchDepth = 2;
 let reflect  = load(LS.reflect, { lastRun:0, proposals:[] });
+let reports  = load(LS.reports, []);
+let research = { running:false, log:[], report:null };
 
 let tab = "chat";
 let session = { id:Date.now(), started:Date.now(), turns:[] };
@@ -154,7 +161,7 @@ function cosine(q, b64){ const f = decVec(b64); let d=0, nq=0, nf=0;
 
 // ── Claude API (BYO key) ──
 async function claude(messages, opts={}){
-  const body = { model: settings.claudeModel, max_tokens: opts.maxTokens||3000, messages };
+  const body = { model: opts.model || settings.claudeModel, max_tokens: opts.maxTokens||3000, messages };
   if(opts.system) body.system = opts.system;
   if(opts.webSearch) body.tools = [{ type:"web_search_20250305", name:"web_search" }];
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -329,6 +336,111 @@ function setChatStatus(t, p){
     if(p!==undefined) bar.firstElementChild.style.width = Math.round(p*100)+"%"; }
 }
 
+// ── search proxy (Brave via Cloudflare Worker) ──
+let lastSearchAt = 0;
+async function braveSearch(query, freshness){
+  const wait = 1150 - (Date.now() - lastSearchAt);   // pace under free-tier 1 req/sec
+  if(wait > 0) await new Promise(r=>setTimeout(r, wait));
+  let url = settings.proxyUrl.replace(/\/$/,"") + "/?q=" + encodeURIComponent(query) + "&count=8";
+  if(freshness) url += "&freshness=" + freshness;
+  for(let attempt=0; attempt<3; attempt++){
+    lastSearchAt = Date.now();
+    const res = await fetch(url);
+    if(res.status === 429){ await new Promise(r=>setTimeout(r, 1500*(attempt+1))); continue; }
+    if(!res.ok) throw new Error("search HTTP "+res.status);
+    const data = await res.json();
+    const web = (data.web?.results||[]).map(r=>({ t:r.title, u:r.url,
+      d:(r.description||"").replace(/<[^>]+>/g,""), age:r.age||"", kind:"web" }));
+    const news = (data.news?.results||[]).map(r=>({ t:r.title, u:r.url,
+      d:(r.description||"").replace(/<[^>]+>/g,""), age:r.age||"", kind:"news" }));
+    return [...news, ...web];   // news first for time-sensitive topics; videos skipped
+  }
+  return [];
+}
+
+function rlog(msg){ research.log.push(msg); if(tab==="research") renderTab(); }
+
+async function runResearch(question, depth){
+  if(!settings.apiKey){ alert("Add your Anthropic API key in Settings first."); return; }
+  if(!navigator.onLine){ alert("Research needs an internet connection."); return; }
+  research = { running:true, log:[], report:null, question };
+  renderTab();
+  try{
+    // PLAN (cheap model)
+    rlog("Planning research dimensions…");
+    const planRaw = await claude([{ role:"user", content:
+`Break this research request into a focused plan: "${question}"
+Identify 4-7 distinct dimensions to investigate. For each, give 1-2 specific web search queries.
+Mark time-sensitive dimensions (news, prices, current events) with "fresh":true.
+Return ONLY JSON: {"topic":"short label","dimensions":[{"name":"...","queries":["..."],"fresh":true|false}]}` }],
+      { model: settings.planModel, maxTokens: 1500 });
+    const plan = parseJSON(planRaw);
+    rlog(`Plan: ${plan.dimensions.length} dimensions.`);
+
+    // GATHER (layer 1)
+    let evidence = [];
+    for(const dim of plan.dimensions){
+      for(const q of dim.queries.slice(0, depth>=3?2:1)){
+        rlog(`Searching: ${q}`);
+        const hits = await braveSearch(q, dim.fresh?"pw":null);
+        evidence.push({ dim:dim.name, q, hits });
+      }
+    }
+
+    // DEEPEN (conditional layer 2+, only for Standard/Deep)
+    if(depth >= 2){
+      rlog("Reviewing findings for gaps…");
+      const digest = evidence.map(e=>`[${e.dim}] ${e.q}\n`+e.hits.slice(0,4).map(h=>`- ${h.t}: ${h.d}`).join("\n")).join("\n\n").slice(0, 9000);
+      const gapRaw = await claude([{ role:"user", content:
+`Research question: "${question}"
+Findings so far:\n${digest}\n
+Identify gaps, contradictions, or unverified claims worth a second search wave. Give up to ${depth>=3?6:3} targeted follow-up queries.
+Return ONLY JSON: {"followups":[{"query":"...","fresh":true|false}]}` }],
+        { model: settings.planModel, maxTokens: 1000 });
+      const gap = parseJSON(gapRaw);
+      for(const f of (gap.followups||[])){
+        rlog(`Deeper: ${f.query}`);
+        const hits = await braveSearch(f.query, f.fresh?"pw":null);
+        evidence.push({ dim:"follow-up", q:f.query, hits });
+      }
+    }
+
+    // SYNTHESIZE (strong model)
+    rlog("Synthesizing report…");
+    const corpus = evidence.map(e=>`### ${e.dim} — "${e.q}"\n`+
+      e.hits.map(h=>`- [${h.kind}${h.age?", "+h.age:""}] ${h.t}\n  ${h.d}\n  ${h.u}`).join("\n")).join("\n\n").slice(0, 16000);
+    const sys = `You are a research analyst. Write a thorough, balanced report from the gathered evidence. `+
+      `Cite sources inline as [n] with a numbered Sources list. Surface DISAGREEMENTS between sources rather than smoothing them. `+
+      `For any forecast/opinion question, include explicit bull and bear cases. Be honest about uncertainty and evidence gaps. Use markdown.`;
+    const report = await claude([{ role:"user", content:
+`Research question: "${question}"\n\nGATHERED EVIDENCE:\n${corpus}\n\nWrite the report now.` }],
+      { system: sys, maxTokens: 4000 });
+
+    // decompose into fact-cards for offline recall
+    rlog("Decomposing into offline facts…");
+    let factCards = [];
+    try{
+      const factRaw = await claude([{ role:"user", content:
+`From this research report, extract 15-30 atomic facts for an offline knowledge base. Each self-contained, one idea.
+REPORT:\n${report.slice(0, 12000)}
+Return ONLY JSON: {"facts":[{"text":"...","category":"episodic|interest|procedure","aliases":["..."],"confidence":"high|medium|low"}]}` }],
+        { model: settings.planModel, maxTokens: 3000 });
+      factCards = (parseJSON(factRaw).facts)||[];
+    }catch(e){ rlog("(fact extraction skipped: "+e.message+")"); }
+
+    const rec = { id:Date.now(), question, topic:plan.topic||question.slice(0,40),
+      report, created:Date.now(), searches:evidence.length, factCount:factCards.length };
+    reports.unshift(rec); save(LS.reports, reports);
+    if(factCards.length){ rlog(`Embedding ${factCards.length} facts…`);
+      await addFacts(factCards, "research-report"); }
+    research = { running:false, log:research.log, report:rec };
+    rlog("Done.");
+  }catch(e){
+    research.running = false; rlog("Failed: "+e.message);
+  }
+  renderTab();
+}
+
 // ── builder: onboarding ──
 const DECOMPOSE_RULES = `Decompose into ATOMIC facts: one self-contained idea each, meaningful out of context, short.
 Return ONLY JSON: {"profile":"a 60-120 word standing profile paragraph (who they are, where, key context)",
@@ -463,7 +575,7 @@ function esc(s){ return String(s??"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&
 function render(){
   $("statFacts").textContent = facts.length;
   $("statNet").textContent = (navigator.onLine ? (settings.apiKey?"online · claude ready":"online · no key") : "offline · local") + " · " + APP_VERSION;
-  $("tabs").innerHTML = [["chat","Chat"],["know","Knowledge"],["build","Build"],
+  $("tabs").innerHTML = [["chat","Chat"],["research","Research"],["know","Knowledge"],["build","Build"],
     ["reflect",`Reflect${reflect.proposals.length?` (${reflect.proposals.length})`:""}`],["set","⚙"]]
     .map(([id,l])=>`<button class="chip${tab===id?" on":""}" onclick="setTab('${id}')">${l}</button>`).join("");
   $("chatbar").style.display = tab==="chat" ? "block" : "none";
@@ -555,6 +667,41 @@ function renderTab(){
     }
   }
 
+  if(tab==="research"){
+    h += `<div class="card">
+      <div class="display" style="font-size:18px;color:#E8B84B;">Deep Research</div>
+      <div class="muted" style="margin:4px 0 10px;">Claude plans a multi-layer search, gathers via your Brave proxy, and writes a sourced report. Saved to Reports and decomposed into offline facts.</div>
+      <textarea id="researchQ" placeholder="e.g. Analyze Tesla and provide details on its stock direction and future prospects">${esc(research.question||"")}</textarea>
+      <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+        ${[[1,"Quick · 1 layer"],[2,"Standard · 2"],[3,"Deep · 3"]].map(([d,l])=>`<button class="chip${settings.researchDepth===d?" on":""}" onclick="setDepth(${d})">${l}</button>`).join("")}
+      </div>
+      <button class="btn" style="margin-top:12px;width:100%;" onclick="startResearch()" ${research.running?"disabled":""}>${research.running?"Researching\u2026":"Run research"}</button>
+    </div>`;
+    if(research.running || research.log.length){
+      h += `<div class="card"><div class="lbl">Progress</div>`;
+      for(const l of research.log.slice(-14)) h += `<div class="muted" style="margin-top:4px;">${esc(l)}</div>`;
+      h += `</div>`;
+    }
+    if(research.report){
+      const r = research.report;
+      h += `<div class="card"><div class="row">
+        <div class="display" style="font-size:17px;color:#E8B84B;min-width:0;">${esc(r.topic)}</div>
+        <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="speakReport(${r.id})">\u25b6 Read</button></div>
+        <div class="muted" style="margin:4px 0 8px;">${r.searches} searches \u00b7 ${r.factCount} facts stored offline</div>
+        <div style="font-size:14.5px;line-height:1.6;">${mdToHtml(r.report)}</div></div>`;
+    }
+    // report history
+    if(reports.length){
+      h += `<div class="card"><div class="lbl">Saved reports</div>`;
+      for(const r of reports.slice(0,20)){
+        h += `<div class="fact" onclick="openReport(${r.id})" style="cursor:pointer;">
+          <div style="font-size:14.5px;color:#E6EAF0;">${esc(r.topic)}</div>
+          <div class="muted" style="margin-top:3px;">${new Date(r.created).toLocaleDateString()} \u00b7 ${r.factCount} facts \u00b7 tap to open</div></div>`;
+      }
+      h += `</div>`;
+    }
+  }
+
   if(tab==="set"){
     h += `<div class="card"><div class="lbl">Anthropic API key (online brain)</div>
       <input type="password" id="setKey" value="${esc(settings.apiKey)}" placeholder="sk-ant-…">
@@ -563,6 +710,8 @@ function renderTab(){
         <option value="auto" ${settings.route==="auto"?"selected":""}>Auto — Claude online, local offline</option>
         <option value="offline" ${settings.route==="offline"?"selected":""}>Always local (test offline mode)</option>
       </select>
+      <div class="lbl" style="margin-top:10px;">Search proxy URL (Brave via Cloudflare Worker)</div>
+      <input type="text" id="setProxy" value="${esc(settings.proxyUrl)}" placeholder="https://…workers.dev/">
       <button class="btn" style="margin-top:12px;width:100%;" onclick="saveSettings()">Save</button>
     </div>
     <div class="card"><div class="lbl">Offline chat model (WebLLM)</div>
@@ -589,6 +738,23 @@ function renderTab(){
   $("main").innerHTML = h;
 }
 
+function mdToHtml(md){
+  let h = esc(md);
+  h = h.replace(/^### (.*)$/gm,'<div style="font-weight:700;color:#E8B84B;margin-top:12px;">$1</div>');
+  h = h.replace(/^## (.*)$/gm,'<div style="font-weight:700;font-size:16px;color:#E8B84B;margin-top:14px;">$1</div>');
+  h = h.replace(/^# (.*)$/gm,'<div style="font-weight:700;font-size:17px;color:#E8B84B;margin-top:14px;">$1</div>');
+  h = h.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+  h = h.replace(/^\s*[-*] (.*)$/gm,'<div style="margin-left:12px;">\u2022 $1</div>');
+  h = h.replace(/\[(\d+)\]/g,'<sup style="color:#E8B84B;">[$1]</sup>');
+  h = h.replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');
+  return h;
+}
+window.setDepth = d => { settings.researchDepth = d; save(LS.settings, settings); renderTab(); };
+window.startResearch = () => { const q = document.getElementById("researchQ").value.trim();
+  if(q) runResearch(q, settings.researchDepth); };
+window.openReport = id => { research = { running:false, log:[], report: reports.find(r=>r.id===id) }; renderTab(); window.scrollTo(0,0); };
+window.speakReport = id => { const r = reports.find(x=>x.id===id); if(r) speak(r.report.replace(/[#*\[\]]/g,"").slice(0,4000)); };
+
 // ── window actions ──
 window.setTab = t => { tab = t; render(); };
 window.sendMsg = sendMsg;
@@ -606,6 +772,7 @@ window.renderTab = renderTab;
 window.saveSettings = () => {
   settings.apiKey = $("setKey").value.trim();
   settings.route = $("setRoute").value;
+  if($("setProxy")) settings.proxyUrl = $("setProxy").value.trim();
   settings.webllmModel = $("setModel") ? $("setModel").value : settings.webllmModel;
   settings.ttsRate = parseFloat($("setRate")?.value||"1.0");
   save(LS.settings, settings);
