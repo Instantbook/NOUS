@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v3b";
+const APP_VERSION = "v3c";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -894,10 +894,12 @@ function renderTab(){
         <div class="display" style="font-size:17px;color:#E8B84B;">${esc(r.topic)}</div>
         <div class="muted" style="margin:4px 0 10px;">${r.searches} searches \u00b7 ${r.factCount} facts stored offline \u00b7 ${new Date(r.created).toLocaleDateString()}</div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+          <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="closeReport()">\u2715 Close</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="speakReport(${r.id})">\u25b6 Read</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="discussReport(${r.id})">\ud83d\udcac Discuss</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="exportReportMd(${r.id})">\u2b07 .md</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="exportReportPdf(${r.id})">\ud83d\udcc4 PDF</button>
+          <button class="btn ghost" style="padding:7px 12px;font-size:13px;color:#E89FB4;border-color:#E89FB4;" onclick="deleteReport(${r.id})">\ud83d\uddd1 Delete</button>
         </div>
         <div style="font-size:14.5px;line-height:1.6;">${mdToHtml(r.report)}</div></div>`;
     }
@@ -905,9 +907,11 @@ function renderTab(){
     if(reports.length){
       h += `<div class="card"><div class="lbl">Saved reports</div>`;
       for(const r of reports.slice(0,20)){
-        h += `<div class="fact" onclick="openReport(${r.id})" style="cursor:pointer;">
-          <div style="font-size:14.5px;color:#E6EAF0;">${esc(r.topic)}</div>
-          <div class="muted" style="margin-top:3px;">${new Date(r.created).toLocaleDateString()} \u00b7 ${r.factCount} facts \u00b7 tap to open</div></div>`;
+        h += `<div class="fact" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+          <div style="min-width:0;cursor:pointer;" onclick="openReport(${r.id})">
+            <div style="font-size:14.5px;color:#E6EAF0;">${esc(r.topic)}</div>
+            <div class="muted" style="margin-top:3px;">${new Date(r.created).toLocaleDateString()} \u00b7 ${r.factCount} facts \u00b7 tap to open</div></div>
+          <button style="background:none;border:none;color:#E89FB4;font-size:15px;cursor:pointer;flex-shrink:0;" onclick="deleteReport(${r.id})">\u2715</button></div>`;
       }
       h += `</div>`;
     }
@@ -1046,6 +1050,14 @@ window.discussReport = id => {
   session.turns.push({ role:"ai", via:"discussing report",
     text:`Let's dig into "${r.topic}". Ask me anything about this research \u2014 I have the full report in context.`, ts:Date.now() });
   tab = "chat"; render();
+};
+window.closeReport = () => { research = { running:false, log:[], report:null }; renderTab(); };
+window.deleteReport = id => {
+  if(!confirm("Delete this report? (Facts already saved to your knowledge base stay.)")) return;
+  reports = reports.filter(r=>r.id!==id);
+  save(LS.reports, reports);
+  if(research.report && research.report.id===id) research.report = null;
+  renderTab();
 };
 window.openReport = id => { research = { running:false, log:[], report: reports.find(r=>r.id===id) }; renderTab(); window.scrollTo(0,0); };
 window.speakReport = id => { const r = reports.find(x=>x.id===id); if(r) speak(r.report.replace(/[#*\[\]]/g,"").slice(0,4000)); };
