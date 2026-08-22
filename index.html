@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v2d";
+const APP_VERSION = "v3";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -161,10 +161,7 @@ function cosine(q, b64){ const f = decVec(b64); let d=0, nq=0, nf=0;
   return d / (Math.sqrt(nq)*Math.sqrt(nf) || 1); }
 
 // ── Claude API (BYO key) ──
-async function claude(messages, opts={}){
-  const body = { model: opts.model || settings.claudeModel, max_tokens: opts.maxTokens||3000, messages };
-  if(opts.system) body.system = opts.system;
-  if(opts.webSearch) body.tools = [{ type:"web_search_20250305", name:"web_search" }];
+async function claudeRaw(body){
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method:"POST",
     headers:{ "content-type":"application/json", "x-api-key":settings.apiKey,
@@ -172,8 +169,58 @@ async function claude(messages, opts={}){
     body: JSON.stringify(body)
   });
   if(!res.ok){ const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message || "HTTP "+res.status); }
-  const data = await res.json();
-  return data.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
+  return res.json();
+}
+async function claude(messages, opts={}){
+  const body = { model: opts.model || settings.claudeModel, max_tokens: opts.maxTokens||3000, messages: [...messages] };
+  if(opts.system) body.system = opts.system;
+  const tools = [];
+  if(opts.webSearch) tools.push({ type:"web_search_20250305", name:"web_search" });
+  if(opts.dataTools) tools.push(...NOUS_TOOLS);
+  if(tools.length) body.tools = tools;
+
+  // tool-use loop (for our data tools; web_search is server-side and needs no loop)
+  for(let hop=0; hop<4; hop++){
+    const data = await claudeRaw(body);
+    const toolUses = (data.content||[]).filter(b=>b.type==="tool_use");
+    const ourUses = toolUses.filter(t=>NOUS_TOOL_NAMES.includes(t.name));
+    if(!ourUses.length){
+      return data.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
+    }
+    // execute our tools, feed results back
+    body.messages.push({ role:"assistant", content:data.content });
+    const results = [];
+    for(const u of ourUses){
+      const out = await runNousTool(u.name, u.input);
+      results.push({ type:"tool_result", tool_use_id:u.id, content: JSON.stringify(out).slice(0,4000) });
+    }
+    body.messages.push({ role:"user", content: results });
+  }
+  // safety exit
+  const final = await claudeRaw(body);
+  return final.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
+}
+
+// Tool definitions Claude can call (online orchestration on top of the deterministic layer)
+const NOUS_TOOLS = [
+  { name:"get_stock_quote", description:"Get current/recent price, day range, 52-week range, volume, and market cap for a stock ticker. Use exchange suffixes for non-US (e.g. TOU.TO for Toronto).",
+    input_schema:{ type:"object", properties:{ symbol:{type:"string", description:"Ticker, e.g. AAPL or TOU.TO"} }, required:["symbol"] } },
+  { name:"get_economic_series", description:"Get a recent US economic/commodity data series from FRED. Series IDs: DGS10 (10yr yield), FEDFUNDS, CPIAUCSL (CPI), UNRATE, DCOILWTICO (WTI oil), DHHNGSP (Henry Hub gas), DEXCAUS (CAD/USD).",
+    input_schema:{ type:"object", properties:{ series:{type:"string", description:"FRED series ID"} }, required:["series"] } },
+  { name:"get_weather", description:"Get current conditions and multi-day forecast for a location by coordinates.",
+    input_schema:{ type:"object", properties:{ lat:{type:"number"}, lon:{type:"number"} }, required:["lat","lon"] } },
+  { name:"get_country_data", description:"Get country development data from World Bank. indicator e.g. NY.GDP.MKTP.CD (GDP), SP.POP.TOTL (population), FP.CPI.TOTL.ZG (inflation). country is ISO2 e.g. CA, GR, US.",
+    input_schema:{ type:"object", properties:{ indicator:{type:"string"}, country:{type:"string"} }, required:["indicator","country"] } },
+];
+const NOUS_TOOL_NAMES = NOUS_TOOLS.map(t=>t.name);
+async function runNousTool(name, input){
+  try{
+    if(name==="get_stock_quote") return await fetchQuote(input.symbol);
+    if(name==="get_economic_series") return await fetchMacro(input.series);
+    if(name==="get_weather") return await fetchWeather(input.lat, input.lon);
+    if(name==="get_country_data") return await fetchCountry(input.indicator, input.country);
+  }catch(e){ return { error: e.message }; }
+  return { error: "unknown tool" };
 }
 function parseJSON(raw){
   const clean = raw.replace(/```json|```/g,"").trim();
@@ -219,7 +266,7 @@ async function retrieve(query, k=6, status){
 }
 
 // ── context manager (the star): fill a fixed budget by priority ──
-function assembleOffline(question, hits, reportCtx){
+function assembleOffline(question, hits, reportCtx, liveBlocks){
   let budget = TOKEN_BUDGET - 350;               // reserve for the answer
   const parts = [];
   // 1. profile (frozen, always in)
@@ -228,6 +275,8 @@ function assembleOffline(question, hits, reportCtx){
             `Answer ONLY from the profile and stored facts below plus the conversation. `+
             `If they don't contain the answer, say plainly you don't have that stored (it will be researched later) — never invent facts.`;
   if(profile.text) sys += `\n\nUSER PROFILE:\n${profile.text}`;
+  if(liveBlocks && liveBlocks.length){
+    sys += `\n\nLIVE DATA (current figures, use these exactly):\n${liveBlocks.join("\n")}`; }
   if(reportCtx){ const excerpt = reportCtx.text.slice(0, 4800);
     sys += `\n\nThe user is discussing this research report "${reportCtx.topic}". Answer from it:\n${excerpt}`; }
   budget -= approxTok(sys);
@@ -304,14 +353,25 @@ async function sendMsg(){
   try{
     let reply, via;
     const { hits, best } = await retrieve(q, 6, setChatStatus);
+    // Live data (stock/macro) when online — deterministic, and Claude gets it as context
+    let liveBlocks = [];
+    if(online && settings.proxyUrl){
+      const detectedTicker = detectTicker(q), detectedMacro = detectMacro(q);
+      if(detectedTicker || detectedMacro.length){
+        setChatStatus("Fetching live data…");
+        const live = await gatherLiveData(q, {});
+        liveBlocks = live.blocks;
+      }
+    }
     if(online){
-      via = "claude · online";
+      via = "claude · online" + (liveBlocks.length ? " · live data" : "");
       let sys = `You are ΝΟΥΣ, the user's personal assistant. Be concise, warm, direct. Today is ${new Date().toDateString()}.`;
       if(profile.text) sys += `\nUSER PROFILE:\n${profile.text}`;
+      if(liveBlocks.length) sys += `\n\nLIVE DATA (use these exact figures; quotes may be delayed, not real-time):\n${liveBlocks.join("\n")}`;
       if(session.reportContext) sys += `\n\nThe user is asking about this research report titled "${session.reportContext.topic}":\n${session.reportContext.text.slice(0,9000)}`;
       if(hits.length) sys += `\nSTORED FACTS:\n${hits.map(h=>"- "+h.f.text).join("\n")}`;
       const msgs = session.turns.slice(-10).map(t=>({ role:t.role==="user"?"user":"assistant", content:t.text }));
-      reply = await claude(msgs, { system: sys, maxTokens: 700 });
+      reply = await claude(msgs, { system: sys, maxTokens: 700, dataTools: !!settings.proxyUrl });
     } else {
       if(!webgpuOK()) throw new Error("Offline chat needs WebGPU (iOS 26+ Safari). Connect online or update iOS.");
       via = `local · ${hits.length} facts`;
@@ -319,7 +379,15 @@ async function sendMsg(){
         gaps.push({ q, ts:Date.now() }); save(LS.gaps, gaps);
         via = "local · gap logged";
       }
-      const { system, messages } = assembleOffline(q, hits, session.reportContext);
+      // even in local mode, if we have connectivity, ground stock/macro Qs with live data
+      let localLive = [];
+      if(navigator.onLine && settings.proxyUrl && (detectTicker(q) || detectMacro(q).length)){
+        setChatStatus("Fetching live data…");
+        const live = await gatherLiveData(q, {});
+        localLive = live.blocks;
+        if(localLive.length) via += " · live data";
+      }
+      const { system, messages } = assembleOffline(q, hits, session.reportContext, localLive);
       setChatStatus("thinking…");
       reply = await localGenerate(system, messages, setChatStatus);
     }
@@ -372,6 +440,95 @@ async function braveSearch(query, freshness){
   return [];
 }
 
+// ══════════════════════════════════════════════════════════
+// DATA CAPABILITY LAYER — the Worker's non-search routes
+// Deterministic detection + fetch. Online, Claude can also call
+// these as tools; offline, code fetches them and injects results.
+// ══════════════════════════════════════════════════════════
+function proxyBase(){ return settings.proxyUrl.replace(/\/$/,""); }
+
+async function proxyGet(pathAndQuery){
+  const wait = 1150 - (Date.now() - lastSearchAt);
+  if(wait > 0) await new Promise(r=>setTimeout(r, wait));
+  lastSearchAt = Date.now();
+  const ctl = new AbortController();
+  const timer = setTimeout(()=>ctl.abort(), 15000);
+  try{
+    const res = await fetch(proxyBase() + pathAndQuery, { signal: ctl.signal });
+    clearTimeout(timer);
+    if(!res.ok) return { error: "HTTP "+res.status };
+    return await res.json();
+  }catch(e){ return { error: e.name==="AbortError" ? "timeout" : (e.message||"network error") }; }
+}
+
+async function fetchQuote(symbol){ return proxyGet("/quote?symbol=" + encodeURIComponent(symbol)); }
+async function fetchMacro(series){ return proxyGet("/macro?series=" + encodeURIComponent(series)); }
+async function fetchWeather(lat, lon){ return proxyGet(`/weather?lat=${lat}&lon=${lon}`); }
+async function fetchCountry(indicator, country){ return proxyGet(`/country?indicator=${indicator}&country=${country}`); }
+
+// Common FRED series with plain-language triggers
+const MACRO_SERIES = [
+  { id:"DGS10",     name:"US 10-year Treasury yield", triggers:["interest rate","treasury","yield","10-year","bond"] },
+  { id:"FEDFUNDS",  name:"Fed funds rate",            triggers:["fed funds","federal reserve rate","policy rate","fed rate"] },
+  { id:"CPIAUCSL",  name:"US CPI (inflation)",        triggers:["inflation","cpi","consumer price"] },
+  { id:"UNRATE",    name:"US unemployment rate",      triggers:["unemployment","jobless"] },
+  { id:"DCOILWTICO",name:"WTI crude oil price",       triggers:["oil price","crude","wti","oil"] },
+  { id:"DHHNGSP",   name:"Henry Hub natural gas price",triggers:["natural gas","gas price","henry hub","lng"] },
+  { id:"DEXCAUS",   name:"CAD per USD exchange rate", triggers:["cad","canadian dollar","exchange rate","loonie"] },
+];
+
+// Detect a stock ticker in free text. Matches $TSLA, TOU.TO, "ticker AAPL", bare 1-5 caps with context.
+function detectTicker(text){
+  const t = text.toUpperCase();
+  let m = t.match(/\$([A-Z]{1,5}(?:\.[A-Z]{1,2})?)/);           // $TSLA / $TOU.TO
+  if(m) return m[1];
+  m = t.match(/\b([A-Z]{1,5}\.(?:TO|V|CN|NE))\b/);              // TOU.TO explicit exchange
+  if(m) return m[1];
+  m = t.match(/\b(?:TICKER|STOCK|SYMBOL|SHARES?\s+OF)\s+([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b/);
+  if(m) return m[1];
+  return null;
+}
+
+// Which macro series are relevant to a question (by trigger words)
+function detectMacro(text){
+  const t = text.toLowerCase();
+  return MACRO_SERIES.filter(s => s.triggers.some(tr => t.includes(tr)));
+}
+
+// Does the question ask about weather at a place?
+function detectWeather(text){
+  return /\b(weather|forecast|temperature|rain|snow|umbrella|how (hot|cold)|climate today)\b/i.test(text);
+}
+
+// Gather all relevant live data for a question. Returns { blocks:[strings], summary, quote }
+async function gatherLiveData(question, opts={}){
+  const blocks = []; let quote = null;
+  const ticker = detectTicker(question);
+  if(ticker){
+    if(opts.log) opts.log(`Fetching live quote for ${ticker}…`);
+    const q = await fetchQuote(ticker);
+    if(q && !q.error && q.price != null){
+      quote = q;
+      const parts = [`${q.name||ticker} (${q.symbol}) — ${q.price} ${q.currency||""}`];
+      if(q.change != null) parts.push(`change ${q.change} (${q.changePercent}%)`);
+      if(q.dayLow != null) parts.push(`day ${q.dayLow}-${q.dayHigh}`);
+      if(q.fiftyTwoWeekLow != null) parts.push(`52wk ${q.fiftyTwoWeekLow}-${q.fiftyTwoWeekHigh}`);
+      if(q.volume != null) parts.push(`vol ${q.volume}`);
+      if(q.marketCap != null) parts.push(`mkt cap ${q.marketCap}`);
+      blocks.push(`LIVE QUOTE (${q.source||"proxy"}${q.asOf?", as of "+q.asOf:""}): ${parts.join(", ")}`);
+    } else if(opts.log) opts.log(`  quote unavailable (${q?.error||"no data"}) — proceeding with search only.`);
+  }
+  const macros = detectMacro(question);
+  for(const mseries of macros.slice(0,3)){
+    if(opts.log) opts.log(`Fetching ${mseries.name}…`);
+    const md = await fetchMacro(mseries.id);
+    if(md && !md.error && md.latest){
+      blocks.push(`LIVE ${mseries.name}: ${md.latest.value} (as of ${md.latest.date})`);
+    }
+  }
+  return { blocks, quote, ticker, hadData: blocks.length>0 };
+}
+
 function rlog(msg){ research.log.push(msg);
   try{ localStorage.setItem("nous.lastlog", JSON.stringify(research.log)); }catch(e){}
   if(tab==="research") renderTab(); }
@@ -386,12 +543,17 @@ async function runResearch(question, depth){
     rlog("Planning research dimensions…");
     const planRaw = await claude([{ role:"user", content:
 `Break this research request into a focused plan: "${question}"
+Note: live stock quotes (price, 52-week range, volume) and key economic series (gas, oil, rates, CPI, FX) are AUTOMATICALLY attached separately, so do NOT waste a dimension on "current price" — focus web searches on news, analysis, catalysts, competition, risks, and opinion.
 Identify 4-7 distinct dimensions to investigate. For each, give 1-2 specific web search queries.
 Mark time-sensitive dimensions (news, prices, current events) with "fresh":true.
 Return ONLY JSON: {"topic":"short label","dimensions":[{"name":"...","queries":["..."],"fresh":true|false}]}` }],
       { model: settings.planModel, maxTokens: 1500 });
     const plan = parseJSON(planRaw);
     rlog(`Plan: ${plan.dimensions.length} dimensions.`);
+
+    // LIVE DATA (quotes / macro) before web search
+    const live = await gatherLiveData(question, { log: rlog });
+    if(live.hadData) rlog(`Attached ${live.blocks.length} live data point(s).`);
 
     // GATHER (layer 1)
     let evidence = [];
@@ -422,17 +584,22 @@ Return ONLY JSON: {"followups":[{"query":"...","fresh":true|false}]}` }],
     }
 
     const totalHits = evidence.reduce((n,e)=>n+e.hits.length, 0);
-    if(totalHits === 0){
-      throw new Error("No search results returned — open your Worker URL with ?q=test in Safari to check it's live, and verify the proxy URL in Settings.");
+    if(totalHits === 0 && !live.hadData){
+      throw new Error("No search results or live data returned — open your Worker URL with ?q=test in Safari to check it's live, and verify the proxy URL in Settings.");
     }
     rlog(`Gathered ${totalHits} results across ${evidence.length} searches.`);
     // SYNTHESIZE (strong model)
     rlog("Synthesizing report…");
-    const corpus = evidence.map(e=>`### ${e.dim} — "${e.q}"\n`+
+    let corpus = evidence.map(e=>`### ${e.dim} — "${e.q}"\n`+
       e.hits.map(h=>`- [${h.kind}${h.age?", "+h.age:""}] ${h.t}\n  ${h.d}\n  ${h.u}`).join("\n")).join("\n\n").slice(0, 16000);
+    if(live.hadData){
+      corpus = "## LIVE MARKET/ECONOMIC DATA (authoritative — prefer over article estimates):\n" +
+        live.blocks.join("\n") + "\n\n" + corpus;
+    }
     const sys = `You are a research analyst. Write a thorough, balanced report from the gathered evidence. `+
       `Cite sources inline as [n] with a numbered Sources list. Surface DISAGREEMENTS between sources rather than smoothing them. `+
-      `For any forecast/opinion question, include explicit bull and bear cases. Be honest about uncertainty and evidence gaps. Use markdown.`;
+      `For any forecast/opinion question, include explicit bull and bear cases. Be honest about uncertainty and evidence gaps. `+
+      `If LIVE MARKET/ECONOMIC DATA is provided, use those exact figures for prices/levels/rates rather than estimates from articles, but note that quote data may be delayed (not real-time) and technical levels should be confirmed on a live platform. Use markdown.`;
     const report = await claude([{ role:"user", content:
 `Research question: "${question}"\n\nGATHERED EVIDENCE:\n${corpus}\n\nWrite the report now.` }],
       { system: sys, maxTokens: 4000 });
@@ -740,8 +907,10 @@ function renderTab(){
         <option value="auto" ${settings.route==="auto"?"selected":""}>Auto — Claude online, local offline</option>
         <option value="offline" ${settings.route==="offline"?"selected":""}>Always local (test offline mode)</option>
       </select>
-      <div class="lbl" style="margin-top:10px;">Search proxy URL (Brave via Cloudflare Worker)</div>
+      <div class="lbl" style="margin-top:10px;">Data proxy URL (Cloudflare Worker)</div>
       <input type="text" id="setProxy" value="${esc(settings.proxyUrl)}" placeholder="https://…workers.dev/">
+      <div class="muted" style="margin-top:6px;">Routes your Worker provides: web search, stock quotes (/quote), economic data (/macro), country data (/country), weather (/weather). Stock &amp; macro data auto-attach to research and chat when you ask about a ticker or the economy. <button class="btn ghost" style="padding:4px 10px;font-size:12px;margin-top:6px;" onclick="testProxy()">Test data routes</button></div>
+      <div id="proxyTest" class="muted" style="margin-top:6px;"></div>
       <button class="btn" style="margin-top:12px;width:100%;" onclick="saveSettings()">Save</button>
     </div>
     <div class="card"><div class="lbl">Offline chat model (WebLLM)</div>
@@ -779,6 +948,18 @@ function mdToHtml(md){
   h = h.replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');
   return h;
 }
+window.testProxy = async () => {
+  const el = document.getElementById("proxyTest");
+  el.textContent = "Testing routes\u2026";
+  const results = [];
+  const q = await fetchQuote("AAPL");
+  results.push("Stock quote (AAPL): " + (q && q.price!=null ? "\u2713 "+q.price : "\u2717 "+(q&&q.error||"no data")));
+  const w = await fetchWeather(37.32, 23.13);
+  results.push("Weather: " + (w && !w.error ? "\u2713 ok" : "\u2717 "+(w&&w.error||"fail")));
+  const m = await fetchMacro("DGS10");
+  results.push("Macro (10yr yield): " + (m && m.latest ? "\u2713 "+m.latest.value : "\u2717 "+(m&&m.error||"fail")));
+  el.innerHTML = results.join("<br>");
+};
 window.setDepth = d => {
   const ta = document.getElementById("researchQ");
   if(ta) research.question = ta.value;
