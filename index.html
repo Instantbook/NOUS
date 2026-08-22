@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v3c";
+const APP_VERSION = "v3d";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -209,6 +209,8 @@ const NOUS_TOOLS = [
     input_schema:{ type:"object", properties:{ series:{type:"string", description:"FRED series ID"} }, required:["series"] } },
   { name:"get_weather", description:"Get current conditions and multi-day forecast for a location by coordinates.",
     input_schema:{ type:"object", properties:{ lat:{type:"number"}, lon:{type:"number"} }, required:["lat","lon"] } },
+  { name:"geocode_place", description:"Resolve a place name (city, town) to latitude/longitude before calling get_weather.",
+    input_schema:{ type:"object", properties:{ place:{type:"string"} }, required:["place"] } },
   { name:"get_country_data", description:"Get country development data from World Bank. indicator e.g. NY.GDP.MKTP.CD (GDP), SP.POP.TOTL (population), FP.CPI.TOTL.ZG (inflation). country is ISO2 e.g. CA, GR, US.",
     input_schema:{ type:"object", properties:{ indicator:{type:"string"}, country:{type:"string"} }, required:["indicator","country"] } },
 ];
@@ -219,6 +221,7 @@ async function runNousTool(name, input){
     if(name==="get_economic_series") return await fetchMacro(input.series);
     if(name==="get_weather") return await fetchWeather(input.lat, input.lon);
     if(name==="get_country_data") return await fetchCountry(input.indicator, input.country);
+    if(name==="geocode_place") return await fetchGeocode(input.place);
   }catch(e){ return { error: e.message }; }
   return { error: "unknown tool" };
 }
@@ -369,8 +372,8 @@ async function sendMsg(){
     // Live data (stock/macro) when online — deterministic, and Claude gets it as context
     let liveBlocks = [];
     if(online && settings.proxyUrl){
-      const detectedTicker = detectTicker(q), detectedMacro = detectMacro(q);
-      if(detectedTicker || detectedMacro.length){
+      const needsData = detectTicker(q) || detectMacro(q).length || detectWeather(q);
+      if(needsData){
         setChatStatus("Fetching live data…");
         const live = await gatherLiveData(q, {});
         liveBlocks = live.blocks;
@@ -394,7 +397,7 @@ async function sendMsg(){
       }
       // even in local mode, if we have connectivity, ground stock/macro Qs with live data
       let localLive = [];
-      if(navigator.onLine && settings.proxyUrl && (detectTicker(q) || detectMacro(q).length)){
+      if(navigator.onLine && settings.proxyUrl && (detectTicker(q) || detectMacro(q).length || detectWeather(q))){
         setChatStatus("Fetching live data…");
         const live = await gatherLiveData(q, {});
         localLive = live.blocks;
@@ -478,6 +481,26 @@ async function fetchQuote(symbol){ return proxyGet("/quote?symbol=" + encodeURIC
 async function fetchMacro(series){ return proxyGet("/macro?series=" + encodeURIComponent(series)); }
 async function fetchWeather(lat, lon){ return proxyGet(`/weather?lat=${lat}&lon=${lon}`); }
 async function fetchCountry(indicator, country){ return proxyGet(`/country?indicator=${indicator}&country=${country}`); }
+async function fetchGeocode(place){ return proxyGet("/geocode?q=" + encodeURIComponent(place)); }
+
+// Extract a place name from a weather question ("weather in Kranidi" -> "Kranidi")
+function extractPlace(text){
+  const STOP = /\b(today|tomorrow|tonight|this|next|now|please|weather|forecast|temperature|like|going|the)\b/i;
+  const grab = (m) => {
+    if(!m) return null;
+    let p = m[1].trim();
+    const stop = p.search(STOP);
+    if(stop > 0) p = p.slice(0, stop).trim();
+    p = p.replace(/[?.!,]+$/,"").trim();
+    return p || null;
+  };
+  let m = text.match(/\b(?:weather|forecast|temperature|rain|snow|climate)\b[^.?!]*?\b(?:in|at|for|near)\s+([A-Z][A-Za-z\u00C0-\u017F' -]{1,40})/);
+  let r = grab(m); if(r) return r;
+  m = text.match(/\b(?:in|at|for|near)\s+([A-Z][A-Za-z\u00C0-\u017F' -]{1,40}?)\s+(?:weather|forecast|temperature)/i);
+  return grab(m);
+}
+const WCODE = {0:"clear",1:"mainly clear",2:"partly cloudy",3:"overcast",45:"fog",48:"rime fog",51:"light drizzle",53:"drizzle",55:"heavy drizzle",61:"light rain",63:"rain",65:"heavy rain",71:"light snow",73:"snow",75:"heavy snow",77:"snow grains",80:"rain showers",81:"rain showers",82:"violent rain showers",85:"snow showers",86:"snow showers",95:"thunderstorm",96:"thunderstorm w/ hail",99:"thunderstorm w/ hail"};
+function wdesc(code){ return WCODE[code] || ("code "+code); }
 
 // Common FRED series with plain-language triggers
 const MACRO_SERIES = [
@@ -537,6 +560,31 @@ async function gatherLiveData(question, opts={}){
     const md = await fetchMacro(mseries.id);
     if(md && !md.error && md.latest){
       blocks.push(`LIVE ${mseries.name}: ${md.latest.value} (as of ${md.latest.date})`);
+    }
+  }
+  // WEATHER
+  if(detectWeather(question)){
+    let lat=null, lon=null, placeName=null;
+    const place = extractPlace(question);
+    if(place){
+      if(opts.log) opts.log(`Locating ${place}…`);
+      const g = await fetchGeocode(place);
+      if(g && !g.error){ lat=g.lat; lon=g.lon; placeName=`${g.name}${g.country?", "+g.country:""}`; }
+    }
+    // fall back to profile location coordinates if no place named
+    if(lat==null && profile.lat!=null){ lat=profile.lat; lon=profile.lon; placeName=profile.location||"your location"; }
+    if(lat!=null){
+      if(opts.log) opts.log(`Fetching weather for ${placeName}…`);
+      const wx = await fetchWeather(lat, lon);
+      if(wx && !wx.error && wx.current){
+        const c = wx.current;
+        let line = `LIVE WEATHER (${placeName}): now ${c.temperature_2m}°, ${wdesc(c.weather_code)}, feels ${c.apparent_temperature}°, wind ${c.wind_speed_10m} km/h.`;
+        if(wx.daily && wx.daily.time){
+          const days = wx.daily.time.slice(0,4).map((d,i)=>`${d}: ${wx.daily.temperature_2m_min[i]}–${wx.daily.temperature_2m_max[i]}° ${wdesc(wx.daily.weather_code[i])}`).join("; ");
+          line += ` Forecast — ${days}.`;
+        }
+        blocks.push(line);
+      }
     }
   }
   return { blocks, quote, ticker, hadData: blocks.length>0 };
@@ -665,6 +713,12 @@ ${DECOMPOSE_RULES}`;
     const out = parseJSON(raw);
     profile.text = out.profile || profile.text;
     profile.name = info.name; profile.location = info.now || info.home;
+    // resolve home/current location to coordinates for weather fallback
+    try{
+      const loc = info.now || info.home;
+      if(loc){ const g = await fetchGeocode(loc);
+        if(g && !g.error){ profile.lat = g.lat; profile.lon = g.lon; profile.location = `${g.name}${g.country?", "+g.country:""}`; } }
+    }catch(e){}
     save(LS.profile, profile);
     const n = await addFacts(out.facts||[], "onboarding", setBuildStatus);
     setBuildStatus(`Done — profile set, ${n} facts stored.`);
@@ -968,14 +1022,22 @@ function mdToHtml(md){
 }
 window.testProxy = async () => {
   const el = document.getElementById("proxyTest");
-  el.textContent = "Testing routes\u2026";
+  el.textContent = "Testing all routes\u2026";
   const results = [];
   const q = await fetchQuote("AAPL");
-  results.push("Stock quote (AAPL): " + (q && q.price!=null ? "\u2713 "+q.price : "\u2717 "+(q&&q.error||"no data")));
-  const w = await fetchWeather(37.32, 23.13);
-  results.push("Weather: " + (w && !w.error ? "\u2713 ok" : "\u2717 "+(w&&w.error||"fail")));
+  results.push("US quote (AAPL): " + (q && q.price!=null ? "\u2713 "+q.price+" ("+(q.source||"?")+")" : "\u2717 "+(q&&q.error||"no data")));
+  const qc = await fetchQuote("TOU.TO");
+  results.push("CA quote (TOU.TO): " + (qc && qc.price!=null ? "\u2713 "+qc.price+" ("+(qc.source||"?")+")" : "\u2717 "+(qc&&qc.error||"no data")));
   const m = await fetchMacro("DGS10");
   results.push("Macro (10yr yield): " + (m && m.latest ? "\u2713 "+m.latest.value : "\u2717 "+(m&&m.error||"fail")));
+  const g = await fetchGeocode("Kranidi");
+  results.push("Geocode (Kranidi): " + (g && !g.error ? "\u2713 "+g.lat.toFixed(2)+","+g.lon.toFixed(2) : "\u2717 "+(g&&g.error||"fail")));
+  if(g && !g.error){
+    const w = await fetchWeather(g.lat, g.lon);
+    results.push("Weather: " + (w && w.current ? "\u2713 "+w.current.temperature_2m+"\u00b0 now" : "\u2717 "+(w&&w.error||"fail")));
+  }
+  const co = await fetchCountry("NY.GDP.MKTP.CD","GR");
+  results.push("Country (GR GDP): " + (co && co.latest ? "\u2713 ok" : "\u2717 "+(co&&co.error||"fail")));
   el.innerHTML = results.join("<br>");
 };
 window.setDepth = d => {
