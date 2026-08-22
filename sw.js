@@ -1,5 +1,5 @@
 // ΝΟΥΣ service worker — caches the app shell + CDN libraries for offline
-const CACHE = "nous-v2";
+const CACHE = "nous-v2c";
 const ASSETS = ["./", "./index.html", "./manifest.json", "./icon.png"];
 
 self.addEventListener("install", e => {

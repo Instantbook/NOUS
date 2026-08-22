@@ -114,13 +114,14 @@ let facts    = load(LS.facts, []);
 let profile  = load(LS.profile, { text:"", name:"", location:"" });
 let sessions = load(LS.sessions, []);
 let gaps     = load(LS.gaps, []);
-let settings = load(LS.settings, { apiKey:"", claudeModel:"claude-sonnet-4-6",
+let settings = load(LS.settings, { apiKey:"", claudeModel:"claude-sonnet-5",
                  planModel:"claude-haiku-4-5-20251001",
                  webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, route:"auto",
                  proxyUrl:"https://curly-term-5539.dbazos1.workers.dev/", researchDepth:2 });
 if(!settings.proxyUrl) settings.proxyUrl = "https://curly-term-5539.dbazos1.workers.dev/";
 if(!settings.planModel) settings.planModel = "claude-haiku-4-5-20251001";
 if(settings.researchDepth===undefined) settings.researchDepth = 2;
+if(settings.claudeModel==="claude-sonnet-4-6") settings.claudeModel = "claude-sonnet-5";
 let reflect  = load(LS.reflect, { lastRun:0, proposals:[] });
 let reports  = load(LS.reports, []);
 let research = { running:false, log:[], report:null };
@@ -218,7 +219,7 @@ async function retrieve(query, k=6, status){
 }
 
 // ── context manager (the star): fill a fixed budget by priority ──
-function assembleOffline(question, hits){
+function assembleOffline(question, hits, reportCtx){
   let budget = TOKEN_BUDGET - 350;               // reserve for the answer
   const parts = [];
   // 1. profile (frozen, always in)
@@ -227,6 +228,8 @@ function assembleOffline(question, hits){
             `Answer ONLY from the profile and stored facts below plus the conversation. `+
             `If they don't contain the answer, say plainly you don't have that stored (it will be researched later) — never invent facts.`;
   if(profile.text) sys += `\n\nUSER PROFILE:\n${profile.text}`;
+  if(reportCtx){ const excerpt = reportCtx.text.slice(0, 4800);
+    sys += `\n\nThe user is discussing this research report "${reportCtx.topic}". Answer from it:\n${excerpt}`; }
   budget -= approxTok(sys);
   // 2. retrieved facts (with age so the model can hedge)
   if(hits.length){
@@ -305,6 +308,7 @@ async function sendMsg(){
       via = "claude · online";
       let sys = `You are ΝΟΥΣ, the user's personal assistant. Be concise, warm, direct. Today is ${new Date().toDateString()}.`;
       if(profile.text) sys += `\nUSER PROFILE:\n${profile.text}`;
+      if(session.reportContext) sys += `\n\nThe user is asking about this research report titled "${session.reportContext.topic}":\n${session.reportContext.text.slice(0,9000)}`;
       if(hits.length) sys += `\nSTORED FACTS:\n${hits.map(h=>"- "+h.f.text).join("\n")}`;
       const msgs = session.turns.slice(-10).map(t=>({ role:t.role==="user"?"user":"assistant", content:t.text }));
       reply = await claude(msgs, { system: sys, maxTokens: 700 });
@@ -315,7 +319,7 @@ async function sendMsg(){
         gaps.push({ q, ts:Date.now() }); save(LS.gaps, gaps);
         via = "local · gap logged";
       }
-      const { system, messages } = assembleOffline(q, hits);
+      const { system, messages } = assembleOffline(q, hits, session.reportContext);
       setChatStatus("thinking…");
       reply = await localGenerate(system, messages, setChatStatus);
     }
@@ -684,10 +688,15 @@ function renderTab(){
     }
     if(research.report){
       const r = research.report;
-      h += `<div class="card"><div class="row">
-        <div class="display" style="font-size:17px;color:#E8B84B;min-width:0;">${esc(r.topic)}</div>
-        <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="speakReport(${r.id})">\u25b6 Read</button></div>
-        <div class="muted" style="margin:4px 0 8px;">${r.searches} searches \u00b7 ${r.factCount} facts stored offline</div>
+      h += `<div class="card">
+        <div class="display" style="font-size:17px;color:#E8B84B;">${esc(r.topic)}</div>
+        <div class="muted" style="margin:4px 0 10px;">${r.searches} searches \u00b7 ${r.factCount} facts stored offline \u00b7 ${new Date(r.created).toLocaleDateString()}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+          <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="speakReport(${r.id})">\u25b6 Read</button>
+          <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="discussReport(${r.id})">\ud83d\udcac Discuss</button>
+          <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="exportReportMd(${r.id})">\u2b07 .md</button>
+          <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="exportReportPdf(${r.id})">\ud83d\udcc4 PDF</button>
+        </div>
         <div style="font-size:14.5px;line-height:1.6;">${mdToHtml(r.report)}</div></div>`;
     }
     // report history
@@ -752,6 +761,63 @@ function mdToHtml(md){
 window.setDepth = d => { settings.researchDepth = d; save(LS.settings, settings); renderTab(); };
 window.startResearch = () => { const q = document.getElementById("researchQ").value.trim();
   if(q) runResearch(q, settings.researchDepth); };
+function reportMarkdown(r){
+  const date = new Date(r.created).toLocaleString();
+  return `# ${r.topic}\n\n**Research question:** ${r.question}\n**Generated:** ${date}\n**Sources searched:** ${r.searches}\n\n---\n\n${r.report}\n`;
+}
+window.exportReportMd = id => {
+  const r = reports.find(x=>x.id===id); if(!r) return;
+  const blob = new Blob([reportMarkdown(r)], { type:"text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (r.topic||"report").replace(/[^\w\-]+/g,"_").slice(0,50) + ".md";
+  document.body.appendChild(a); a.click(); a.remove();
+};
+window.exportReportPdf = id => {
+  const r = reports.find(x=>x.id===id); if(!r) return;
+  // Build a clean printable HTML doc and hand it to the browser's print -> Save as PDF
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(r.topic)}</title>
+<style>
+  body{font-family:Georgia,serif;max-width:720px;margin:32px auto;padding:0 20px;color:#1a1a1a;line-height:1.6;}
+  h1{font-size:24px;border-bottom:2px solid #E8B84B;padding-bottom:8px;}
+  h2{font-size:18px;margin-top:24px;} h3{font-size:15px;color:#7a5a10;}
+  .meta{color:#666;font-size:13px;margin-bottom:24px;}
+  sup{color:#b8860b;} a{color:#0645ad;word-break:break-all;}
+  @media print{ body{margin:0;} }
+</style></head><body>
+<h1>${esc(r.topic)}</h1>
+<div class="meta"><b>Question:</b> ${esc(r.question)}<br><b>Generated:</b> ${esc(new Date(r.created).toLocaleString())} &middot; ${r.searches} searches</div>
+${mdToHtmlPrint(r.report)}
+<script>window.onload=function(){setTimeout(function(){window.print();},400);}<\/script>
+</body></html>`;
+  const w = window.open("", "_blank");
+  if(!w){ alert("Allow pop-ups for this site to export PDF, or use .md export."); return; }
+  w.document.write(html); w.document.close();
+};
+// print-friendly markdown -> html (dark-theme colors stripped)
+function mdToHtmlPrint(md){
+  let h = esc(md);
+  h = h.replace(/^### (.*)$/gm,'<h3>$1</h3>');
+  h = h.replace(/^## (.*)$/gm,'<h2>$1</h2>');
+  h = h.replace(/^# (.*)$/gm,'<h2>$1</h2>');
+  h = h.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+  h = h.replace(/^\s*[-*] (.*)$/gm,'<li>$1</li>');
+  h = h.replace(/(<li>.*<\/li>)/gs, m=>'<ul>'+m+'</ul>');
+  h = h.replace(/\[(\d+)\]/g,'<sup>[$1]</sup>');
+  h = h.replace(/(https?:\/\/[^\s<]+)/g,'<a href="$1">$1</a>');
+  h = h.replace(/\n{2,}/g,'</p><p>').replace(/\n/g,'<br>');
+  return '<p>'+h+'</p>';
+}
+window.discussReport = id => {
+  const r = reports.find(x=>x.id===id); if(!r) return;
+  // start a fresh chat session primed with this report as focused context
+  session = { id:Date.now(), started:Date.now(), turns:[], reportContext:{ topic:r.topic, text:r.report } };
+  sessions.push(session); if(sessions.length>20) sessions = sessions.slice(-20);
+  save(LS.sessions, sessions);
+  session.turns.push({ role:"ai", via:"discussing report",
+    text:`Let's dig into "${r.topic}". Ask me anything about this research \u2014 I have the full report in context.`, ts:Date.now() });
+  tab = "chat"; render();
+};
 window.openReport = id => { research = { running:false, log:[], report: reports.find(r=>r.id===id) }; renderTab(); window.scrollTo(0,0); };
 window.speakReport = id => { const r = reports.find(x=>x.id===id); if(r) speak(r.report.replace(/[#*\[\]]/g,"").slice(0,4000)); };
 
