@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v2";
+const APP_VERSION = "v2d";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -347,22 +347,34 @@ async function braveSearch(query, freshness){
   if(wait > 0) await new Promise(r=>setTimeout(r, wait));
   let url = settings.proxyUrl.replace(/\/$/,"") + "/?q=" + encodeURIComponent(query) + "&count=8";
   if(freshness) url += "&freshness=" + freshness;
+  let lastErr = "";
   for(let attempt=0; attempt<3; attempt++){
     lastSearchAt = Date.now();
-    const res = await fetch(url);
-    if(res.status === 429){ await new Promise(r=>setTimeout(r, 1500*(attempt+1))); continue; }
-    if(!res.ok) throw new Error("search HTTP "+res.status);
-    const data = await res.json();
-    const web = (data.web?.results||[]).map(r=>({ t:r.title, u:r.url,
-      d:(r.description||"").replace(/<[^>]+>/g,""), age:r.age||"", kind:"web" }));
-    const news = (data.news?.results||[]).map(r=>({ t:r.title, u:r.url,
-      d:(r.description||"").replace(/<[^>]+>/g,""), age:r.age||"", kind:"news" }));
-    return [...news, ...web];   // news first for time-sensitive topics; videos skipped
+    try{
+      const ctl = new AbortController();
+      const timer = setTimeout(()=>ctl.abort(), 15000);   // 15s timeout per request
+      const res = await fetch(url, { signal: ctl.signal });
+      clearTimeout(timer);
+      if(res.status === 429){ lastErr="rate limited"; await new Promise(r=>setTimeout(r, 1500*(attempt+1))); continue; }
+      if(!res.ok){ lastErr="HTTP "+res.status; await new Promise(r=>setTimeout(r, 800*(attempt+1))); continue; }
+      const data = await res.json();
+      const web = (data.web?.results||[]).map(r=>({ t:r.title, u:r.url,
+        d:(r.description||"").replace(/<[^>]+>/g,""), age:r.age||"", kind:"web" }));
+      const news = (data.news?.results||[]).map(r=>({ t:r.title, u:r.url,
+        d:(r.description||"").replace(/<[^>]+>/g,""), age:r.age||"", kind:"news" }));
+      return [...news, ...web];
+    }catch(e){
+      lastErr = e.name==="AbortError" ? "timeout" : (e.message||"network error");
+      await new Promise(r=>setTimeout(r, 900*(attempt+1)));
+    }
   }
+  rlog(`  \u26a0 search skipped ("${query.slice(0,40)}"): ${lastErr}`);
   return [];
 }
 
-function rlog(msg){ research.log.push(msg); if(tab==="research") renderTab(); }
+function rlog(msg){ research.log.push(msg);
+  try{ localStorage.setItem("nous.lastlog", JSON.stringify(research.log)); }catch(e){}
+  if(tab==="research") renderTab(); }
 
 async function runResearch(question, depth){
   if(!settings.apiKey){ alert("Add your Anthropic API key in Settings first."); return; }
@@ -409,6 +421,11 @@ Return ONLY JSON: {"followups":[{"query":"...","fresh":true|false}]}` }],
       }
     }
 
+    const totalHits = evidence.reduce((n,e)=>n+e.hits.length, 0);
+    if(totalHits === 0){
+      throw new Error("No search results returned — open your Worker URL with ?q=test in Safari to check it's live, and verify the proxy URL in Settings.");
+    }
+    rlog(`Gathered ${totalHits} results across ${evidence.length} searches.`);
     // SYNTHESIZE (strong model)
     rlog("Synthesizing report…");
     const corpus = evidence.map(e=>`### ${e.dim} — "${e.q}"\n`+
@@ -680,6 +697,10 @@ function renderTab(){
         ${[[1,"Quick · 1 layer"],[2,"Standard · 2"],[3,"Deep · 3"]].map(([d,l])=>`<button class="chip${settings.researchDepth===d?" on":""}" onclick="setDepth(${d})">${l}</button>`).join("")}
       </div>
       <button class="btn" style="margin-top:12px;width:100%;" onclick="startResearch()" ${research.running?"disabled":""}>${research.running?"Researching\u2026":"Run research"}</button>
+      <div style="display:flex;gap:6px;margin-top:8px;">
+        <button class="btn ghost" style="flex:1;padding:8px;font-size:12.5px;" onclick="showLastLog()">View last log</button>
+        <button class="btn ghost" style="flex:1;padding:8px;font-size:12.5px;" onclick="copyLog()">Copy log</button>
+      </div>
     </div>`;
     if(research.running || research.log.length){
       h += `<div class="card"><div class="lbl">Progress</div>`;
@@ -758,7 +779,20 @@ function mdToHtml(md){
   h = h.replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');
   return h;
 }
-window.setDepth = d => { settings.researchDepth = d; save(LS.settings, settings); renderTab(); };
+window.setDepth = d => {
+  const ta = document.getElementById("researchQ");
+  if(ta) research.question = ta.value;
+  settings.researchDepth = d; save(LS.settings, settings); renderTab();
+};
+window.showLastLog = () => {
+  try{ const l = JSON.parse(localStorage.getItem("nous.lastlog")||"[]");
+    research.log = l; research.running = false; renderTab(); }catch(e){}
+};
+window.copyLog = () => {
+  const text = (research.log||[]).join("\n");
+  if(navigator.clipboard) navigator.clipboard.writeText(text).then(()=>alert("Log copied")).catch(()=>prompt("Copy the log:", text));
+  else prompt("Copy the log:", text);
+};
 window.startResearch = () => { const q = document.getElementById("researchQ").value.trim();
   if(q) runResearch(q, settings.researchDepth); };
 function reportMarkdown(r){
