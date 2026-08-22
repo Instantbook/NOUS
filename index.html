@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v3";
+const APP_VERSION = "v3b";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -223,9 +223,22 @@ async function runNousTool(name, input){
   return { error: "unknown tool" };
 }
 function parseJSON(raw){
-  const clean = raw.replace(/```json|```/g,"").trim();
-  const start = Math.min(...[clean.indexOf("{"), clean.indexOf("[")].filter(i=>i>=0));
-  return JSON.parse(clean.slice(start));
+  if(!raw || typeof raw !== "string") throw new Error("empty AI response");
+  let clean = raw.replace(/```json|```/g,"").trim();
+  // find the first { or [ and the matching last } or ]
+  const firstObj = clean.indexOf("{"), firstArr = clean.indexOf("[");
+  const cands = [firstObj, firstArr].filter(i=>i>=0);
+  if(!cands.length) throw new Error("no JSON found in AI response: " + clean.slice(0,120));
+  const start = Math.min(...cands);
+  const lastObj = clean.lastIndexOf("}"), lastArr = clean.lastIndexOf("]");
+  const end = Math.max(lastObj, lastArr);
+  const slice = (end > start) ? clean.slice(start, end+1) : clean.slice(start);
+  try{ return JSON.parse(slice); }
+  catch(e){
+    // last-ditch: strip trailing commas and retry
+    try{ return JSON.parse(slice.replace(/,(\s*[}\]])/g, "$1")); }
+    catch(e2){ throw new Error("could not parse AI JSON (" + e.message + ")"); }
+  }
 }
 
 // ── fact store ──
@@ -613,8 +626,9 @@ Return ONLY JSON: {"followups":[{"query":"...","fresh":true|false}]}` }],
 REPORT:\n${report.slice(0, 12000)}
 Return ONLY JSON: {"facts":[{"text":"...","category":"episodic|interest|procedure","aliases":["..."],"confidence":"high|medium|low"}]}` }],
         { model: settings.planModel, maxTokens: 3000 });
-      factCards = (parseJSON(factRaw).facts)||[];
-    }catch(e){ rlog("(fact extraction skipped: "+e.message+")"); }
+      const parsed = parseJSON(factRaw);
+      factCards = (parsed && parsed.facts) || [];
+    }catch(e){ rlog("(fact extraction skipped: "+e.message+") — report is still saved."); factCards = []; }
 
     const rec = { id:Date.now(), question, topic:plan.topic||question.slice(0,40),
       report, created:Date.now(), searches:evidence.length, factCount:factCards.length };
