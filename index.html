@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v3d";
+const APP_VERSION = "v3g";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -106,29 +106,72 @@ const SIM_THRESHOLD = 0.30;      // below this, retrieval counts as a gap
 const TOKEN_BUDGET = 2800;       // approx tokens for assembled offline prompt
 const approxTok = s => Math.ceil((s||"").length / 4);
 
-// ── storage ──
-function load(k, fb){ try{ const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; }catch(e){ return fb; } }
-function save(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){ console.error("save", e); alert("Storage full — export & prune your knowledge base."); } }
+// ── storage: IndexedDB (via idb-keyval) with a synchronous in-memory cache ──
+// save() stays synchronous in signature (writes cache, fires async to IDB), so
+// all existing call sites are unchanged. Everything loads once at startup.
+let idbSet = null, idbGet = null;          // bound after dynamic import
+const memCache = {};                        // key -> parsed value (source of truth in RAM)
+function load(k, fb){ return (k in memCache) ? memCache[k] : fb; }
+function save(k, v){
+  memCache[k] = v;
+  if(idbSet){ idbSet(k, v).catch(e=>console.error("idb save", k, e)); }
+  else { try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } // pre-init fallback
+}
 
-let facts    = load(LS.facts, []);
-let profile  = load(LS.profile, { text:"", name:"", location:"" });
-let sessions = load(LS.sessions, []);
-let gaps     = load(LS.gaps, []);
-let settings = load(LS.settings, { apiKey:"", claudeModel:"claude-sonnet-5",
-                 planModel:"claude-haiku-4-5-20251001",
-                 webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, route:"auto",
-                 proxyUrl:"https://curly-term-5539.dbazos1.workers.dev/", researchDepth:2 });
-if(!settings.proxyUrl) settings.proxyUrl = "https://curly-term-5539.dbazos1.workers.dev/";
-if(!settings.planModel) settings.planModel = "claude-haiku-4-5-20251001";
-if(settings.researchDepth===undefined) settings.researchDepth = 2;
-if(settings.claudeModel==="claude-sonnet-4-6") settings.claudeModel = "claude-sonnet-5";
-let reflect  = load(LS.reflect, { lastRun:0, proposals:[] });
-let reports  = load(LS.reports, []);
-let research = { running:false, log:[], report:null };
-
+// declared now, populated in initStorage() before first render
+let facts=[], profile={ text:"", name:"", location:"" }, sessions=[], gaps=[],
+    settings={}, reflect={ lastRun:0, proposals:[] }, reports=[],
+    research={ running:false, log:[], report:null };
 let tab = "chat";
 let session = { id:Date.now(), started:Date.now(), turns:[] };
-sessions.push(session); if(sessions.length>20) sessions = sessions.slice(-20); save(LS.sessions, sessions);
+
+async function initStorage(){
+  // Ask the OS to keep our IndexedDB + cached model weights from being evicted
+  try{ if(navigator.storage && navigator.storage.persist){ await navigator.storage.persist(); } }catch(e){}
+  try{
+    const idb = await import("https://cdn.jsdelivr.net/npm/idb-keyval@6/+esm");
+    idbGet = idb.get; idbSet = idb.set;
+  }catch(e){ console.error("idb import failed, using localStorage", e); }
+
+  const read = async (k, fb) => {
+    if(idbGet){
+      try{ const v = await idbGet(k); if(v !== undefined) return v; }catch(e){}
+    }
+    // one-time migration from old localStorage (or fallback if idb unavailable)
+    try{ const ls = localStorage.getItem(k); if(ls != null){ const parsed = JSON.parse(ls);
+      if(idbSet) idbSet(k, parsed).catch(()=>{});   // copy into idb
+      return parsed; } }catch(e){}
+    return fb;
+  };
+
+  facts    = await read(LS.facts, []);
+  profile  = await read(LS.profile, { text:"", name:"", location:"" });
+  sessions = await read(LS.sessions, []);
+  gaps     = await read(LS.gaps, []);
+  settings = await read(LS.settings, {});
+  reflect  = await read(LS.reflect, { lastRun:0, proposals:[] });
+  reports  = await read(LS.reports, []);
+
+  // settings defaults / migrations
+  const sd = { apiKey:"", claudeModel:"claude-sonnet-5", planModel:"claude-haiku-4-5-20251001",
+    webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, route:"auto",
+    proxyUrl:"https://curly-term-5539.dbazos1.workers.dev/", researchDepth:2 };
+  settings = Object.assign({}, sd, settings);
+  if(!settings.proxyUrl) settings.proxyUrl = sd.proxyUrl;
+  if(!settings.planModel) settings.planModel = sd.planModel;
+  if(settings.researchDepth===undefined) settings.researchDepth = 2;
+  if(settings.claudeModel==="claude-sonnet-4-6") settings.claudeModel = "claude-sonnet-5";
+
+  // prime memCache so synchronous save() has the current values
+  memCache[LS.facts]=facts; memCache[LS.profile]=profile; memCache[LS.sessions]=sessions;
+  memCache[LS.gaps]=gaps; memCache[LS.settings]=settings; memCache[LS.reflect]=reflect;
+  memCache[LS.reports]=reports;
+
+  // start a fresh session
+  session = { id:Date.now(), started:Date.now(), turns:[] };
+  sessions.push(session); if(sessions.length>20) sessions = sessions.slice(-20);
+  save(LS.sessions, sessions);
+}
 
 let busy = false;
 let engine = null, engineModel = null, engineLoading = false;
@@ -171,6 +214,31 @@ async function claudeRaw(body){
   if(!res.ok){ const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message || "HTTP "+res.status); }
   return res.json();
 }
+async function claudeStream(body, onToken){
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers:{ "content-type":"application/json", "x-api-key":settings.apiKey,
+      "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" },
+    body: JSON.stringify({ ...body, stream:true })
+  });
+  if(!res.ok){ const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message || "HTTP "+res.status); }
+  const reader = res.body.getReader(); const dec = new TextDecoder();
+  let full = "", buf = "";
+  while(true){
+    const { done, value } = await reader.read(); if(done) break;
+    buf += dec.decode(value, { stream:true });
+    const lines = buf.split("\n"); buf = lines.pop();
+    for(const line of lines){
+      if(!line.startsWith("data:")) continue;
+      try{ const ev = JSON.parse(line.slice(5).trim());
+        if(ev.type==="content_block_delta" && ev.delta?.type==="text_delta"){
+          full += ev.delta.text; if(onToken) onToken(full);
+        }
+      }catch(e){}
+    }
+  }
+  return full.trim();
+}
 async function claude(messages, opts={}){
   const body = { model: opts.model || settings.claudeModel, max_tokens: opts.maxTokens||3000, messages: [...messages] };
   if(opts.system) body.system = opts.system;
@@ -178,6 +246,8 @@ async function claude(messages, opts={}){
   if(opts.webSearch) tools.push({ type:"web_search_20250305", name:"web_search" });
   if(opts.dataTools) tools.push(...NOUS_TOOLS);
   if(tools.length) body.tools = tools;
+  // stream only when caller asks AND no tools (tool loop needs full blocks)
+  if(opts.onToken && !tools.length){ return claudeStream(body, opts.onToken); }
 
   // tool-use loop (for our data tools; web_search is server-side and needs no loop)
   for(let hop=0; hop<4; hop++){
@@ -249,13 +319,21 @@ async function addFacts(cards, source, status){
   let added = 0;
   for(const c of cards){
     if(!c.text) continue;
-    if(facts.find(f => f.text.toLowerCase() === c.text.trim().toLowerCase())) continue; // dedupe
+    if(facts.find(f => f.status!=="superseded" && f.text.toLowerCase() === c.text.trim().toLowerCase())) continue; // dedupe
+    // supersede: archive any old fact this one explicitly replaces
+    if(Array.isArray(c.replaces)){
+      for(const oldText of c.replaces){
+        const victim = facts.find(f => f.status!=="superseded" &&
+          f.text.toLowerCase() === String(oldText).trim().toLowerCase());
+        if(victim){ victim.status = "superseded"; victim.supersededBy = c.text.trim(); victim.supersededAt = Date.now(); }
+      }
+    }
     if(status) status(`Embedding ${added+1}/${cards.length}…`);
     const vec = await embedText(c.text, status);
     facts.push({ id:Date.now()+Math.random(), text:c.text.trim(),
       category:["identity","ambient","interest","episodic","procedure"].includes(c.category)?c.category:"episodic",
       aliases:Array.isArray(c.aliases)?c.aliases.slice(0,8):[],
-      source, confidence:c.confidence||"medium",
+      source, confidence:c.confidence||"medium", status:"active",
       created:Date.now(), verified:Date.now(), emb:encVec(vec) });
     added++;
   }
@@ -266,9 +344,29 @@ function ageOf(f){ const d = Math.floor((Date.now()-(f.verified||f.created))/864
   return d<1?"today":d<30?d+"d ago":Math.floor(d/30)+"mo ago"; }
 
 // ── retrieval ──
+// keyword/exact-match score: rewards facts containing the query's distinctive tokens
+// (part numbers, tickers, names) that semantic embeddings can rank too low.
+function keywordScore(queryTokens, fact){
+  if(!queryTokens.length) return 0;
+  const hay = (fact.text + " " + (fact.aliases||[]).join(" ")).toLowerCase();
+  let hit = 0;
+  for(const tok of queryTokens){
+    if(hay.includes(tok)){
+      hit += 1;
+      // bonus for alphanumeric/technical tokens (contain a digit or a dot) — exact strings matter most
+      if(/[0-9.]/.test(tok)) hit += 0.5;
+    }
+  }
+  return hit / queryTokens.length;   // 0..1.5-ish, normalized by token count
+}
+function tokenize(q){
+  return q.toLowerCase().match(/[a-z0-9][a-z0-9.\-]{1,}/gi)?.filter(t=>t.length>1
+    && !["the","and","for","what","how","was","are","with","this","that","from"].includes(t)) || [];
+}
+
 async function retrieve(query, k=6, status){
   if(facts.length===0) return { hits:[], best:0 };
-  // alias expansion: append alias words whose trigger appears in the query
+  // alias expansion
   let expanded = query;
   const ql = query.toLowerCase();
   const extra = new Set();
@@ -276,8 +374,16 @@ async function retrieve(query, k=6, status){
     if(ql.includes(a.toLowerCase())) (f.aliases||[]).forEach(x=>extra.add(x));
   if(extra.size) expanded += " " + [...extra].slice(0,10).join(" ");
   const q = await embedText(expanded, status);
-  const scored = facts.map(f=>({ f, s: cosine(q, f.emb) })).sort((a,b)=>b.s-a.s);
-  const hits = scored.slice(0, k).filter(x=>x.s >= SIM_THRESHOLD);
+  const qTokens = tokenize(query);
+  // hybrid: 0.7 * cosine + 0.3 * keyword — surfaces exact names/numbers reliably
+  const active = facts.filter(f => f.status !== "superseded");
+  const scored = active.map(f=>{
+    const cos = cosine(q, f.emb);
+    const kw = keywordScore(qTokens, f);
+    return { f, cos, kw, s: 0.7*cos + 0.3*Math.min(kw,1) };
+  }).sort((a,b)=>b.s-a.s);
+  // keep a hit if hybrid clears threshold OR keyword match is strong (exact string found)
+  const hits = scored.slice(0, k).filter(x=>x.s >= SIM_THRESHOLD || x.kw >= 0.75);
   return { hits, best: scored[0]?.s || 0 };
 }
 
@@ -338,8 +444,19 @@ async function getEngine(status){
     return engine;
   } finally { engineLoading = false; }
 }
-async function localGenerate(system, messages, status){
+async function localGenerate(system, messages, status, onToken){
   const eng = await getEngine(status);
+  if(onToken){
+    const chunks = await eng.chat.completions.create({
+      messages: [{ role:"system", content: system }, ...messages],
+      temperature: 0.6, max_tokens: 300, stream: true });
+    let full = "";
+    for await (const chunk of chunks){
+      const delta = chunk.choices?.[0]?.delta?.content || "";
+      if(delta){ full += delta; onToken(full); }
+    }
+    return full.trim();
+  }
   const r = await eng.chat.completions.create({
     messages: [{ role:"system", content: system }, ...messages],
     temperature: 0.6, max_tokens: 300 });
@@ -354,6 +471,32 @@ function speak(text){
     u.rate = settings.ttsRate || 1.0;
     speechSynthesis.speak(u);
   }catch(e){}
+}
+
+// ── live streaming into the chat without full re-render ──
+let streamEl = null;
+function beginStream(via){
+  // ensure the chat card exists, then append a live AI bubble we mutate directly
+  const main = document.getElementById("main");
+  let host = document.getElementById("streamHost");
+  if(!host){
+    // render() will have drawn the chat; append our live bubble at the end of #main
+    host = document.createElement("div");
+    host.id = "streamHost";
+    main.appendChild(host);
+  }
+  host.innerHTML = `<div class="msg ai"><div><div class="bubble" id="streamBubble"></div><div class="meta">${esc(via||"")}</div></div></div>`;
+  streamEl = document.getElementById("streamBubble");
+  if(streamEl) streamEl.textContent = "…";
+  window.scrollTo(0, document.body.scrollHeight);
+}
+function liveStreamToken(fullText){
+  if(streamEl){ streamEl.textContent = fullText; window.scrollTo(0, document.body.scrollHeight); }
+}
+function endStream(){
+  const host = document.getElementById("streamHost");
+  if(host) host.remove();
+  streamEl = null;
 }
 
 // ── chat send: route online (Claude) / offline (retrieval + WebLLM) ──
@@ -387,7 +530,13 @@ async function sendMsg(){
       if(session.reportContext) sys += `\n\nThe user is asking about this research report titled "${session.reportContext.topic}":\n${session.reportContext.text.slice(0,9000)}`;
       if(hits.length) sys += `\nSTORED FACTS:\n${hits.map(h=>"- "+h.f.text).join("\n")}`;
       const msgs = session.turns.slice(-10).map(t=>({ role:t.role==="user"?"user":"assistant", content:t.text }));
-      reply = await claude(msgs, { system: sys, maxTokens: 700, dataTools: !!settings.proxyUrl });
+      // stream unless data-tools are active (tool loop needs whole blocks)
+      const canStream = !settings.proxyUrl; // dataTools on when proxy set
+      setChatStatus("");
+      beginStream(via);
+      reply = await claude(msgs, { system: sys, maxTokens: 700, dataTools: !!settings.proxyUrl,
+        onToken: canStream ? liveStreamToken : null });
+      endStream();
     } else {
       if(!webgpuOK()) throw new Error("Offline chat needs WebGPU (iOS 26+ Safari). Connect online or update iOS.");
       via = `local · ${hits.length} facts`;
@@ -404,12 +553,15 @@ async function sendMsg(){
         if(localLive.length) via += " · live data";
       }
       const { system, messages } = assembleOffline(q, hits, session.reportContext, localLive);
-      setChatStatus("thinking…");
-      reply = await localGenerate(system, messages, setChatStatus);
+      setChatStatus("");
+      beginStream(via);
+      reply = await localGenerate(system, messages, setChatStatus, liveStreamToken);
+      endStream();
     }
     session.turns.push({ role:"ai", text:reply, via, ts:Date.now() });
     save(LS.sessions, sessions);
     speak(reply);
+    streamEl = null;
   }catch(e){
     session.turns.push({ role:"ai", text:"⚠ "+e.message, via:"error", ts:Date.now() });
     save(LS.sessions, sessions);
@@ -426,14 +578,25 @@ function setChatStatus(t, p){
 
 // ── search proxy (Brave via Cloudflare Worker) ──
 let lastSearchAt = 0;
+let proxyQueue = Promise.resolve();                    // serialize all proxy calls (no 429 races)
+function pacedSlot(){
+  // chain onto the queue; each slot resolves >=1150ms after the previous one started
+  const run = proxyQueue.then(async () => {
+    const wait = 1150 - (Date.now() - lastSearchAt);
+    if(wait > 0) await new Promise(r=>setTimeout(r, wait));
+    lastSearchAt = Date.now();
+  });
+  proxyQueue = run.catch(()=>{});                       // keep the chain alive on errors
+  return run;
+}
 async function braveSearch(query, freshness){
-  const wait = 1150 - (Date.now() - lastSearchAt);   // pace under free-tier 1 req/sec
-  if(wait > 0) await new Promise(r=>setTimeout(r, wait));
+  await pacedSlot();
   let url = settings.proxyUrl.replace(/\/$/,"") + "/?q=" + encodeURIComponent(query) + "&count=8";
   if(freshness) url += "&freshness=" + freshness;
+  if(settings.proxySecret) url += "&k=" + encodeURIComponent(settings.proxySecret);
   let lastErr = "";
   for(let attempt=0; attempt<3; attempt++){
-    lastSearchAt = Date.now();
+    if(attempt>0) await pacedSlot();                      // re-pace before each retry
     try{
       const ctl = new AbortController();
       const timer = setTimeout(()=>ctl.abort(), 15000);   // 15s timeout per request
@@ -462,15 +625,14 @@ async function braveSearch(query, freshness){
 // these as tools; offline, code fetches them and injects results.
 // ══════════════════════════════════════════════════════════
 function proxyBase(){ return settings.proxyUrl.replace(/\/$/,""); }
+function secretParam(){ return settings.proxySecret ? ("k=" + encodeURIComponent(settings.proxySecret)) : "_=1"; }
 
 async function proxyGet(pathAndQuery){
-  const wait = 1150 - (Date.now() - lastSearchAt);
-  if(wait > 0) await new Promise(r=>setTimeout(r, wait));
-  lastSearchAt = Date.now();
+  await pacedSlot();
   const ctl = new AbortController();
   const timer = setTimeout(()=>ctl.abort(), 15000);
   try{
-    const res = await fetch(proxyBase() + pathAndQuery, { signal: ctl.signal });
+    const res = await fetch(proxyBase() + pathAndQuery + (pathAndQuery.includes("?")?"&":"?") + secretParam(), { signal: ctl.signal });
     clearTimeout(timer);
     if(!res.ok) return { error: "HTTP "+res.status };
     return await res.json();
@@ -693,8 +855,9 @@ Return ONLY JSON: {"facts":[{"text":"...","category":"episodic|interest|procedur
 
 // ── builder: onboarding ──
 const DECOMPOSE_RULES = `Decompose into ATOMIC facts: one self-contained idea each, meaningful out of context, short.
+If a new fact contradicts/updates a likely older one, add "replaces":["exact old fact text"] so the old one is archived.
 Return ONLY JSON: {"profile":"a 60-120 word standing profile paragraph (who they are, where, key context)",
-"facts":[{"text":"...","category":"identity|ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low"}]}`;
+"facts":[{"text":"...","category":"identity|ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low","replaces":["..."]}]}`;
 
 async function runOnboard(){
   if(!settings.apiKey){ setBuildStatus("Add your Anthropic API key in Settings first."); return; }
@@ -736,7 +899,7 @@ async function learnTopic(){
     const prompt = `Research this topic for a user's offline knowledge base: "${topic}".
 User profile for context: ${profile.text||"(none)"}
 Use web search for anything current. Be anticipatory: cover the adjacent sub-questions they'll likely ask, not just the literal topic. Aim for 15-30 facts.
-Return ONLY JSON: {"facts":[{"text":"...","category":"ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low"}]}`;
+Return ONLY JSON: {"facts":[{"text":"...","category":"ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low","replaces":["exact text of any outdated fact this updates"]}]}`;
     const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:4000 });
     const out = parseJSON(raw);
     const n = await addFacts(out.facts||[], "research", setBuildStatus);
@@ -745,6 +908,46 @@ Return ONLY JSON: {"facts":[{"text":"...","category":"ambient|interest|episodic|
   }catch(e){ setBuildStatus("Failed: "+e.message); }
   busy = false; render();
 }
+async function ingestPdf(ev){
+  const file = ev.target.files[0]; if(!file) return;
+  if(!settings.apiKey){ setBuildStatus("Add your Anthropic API key in Settings first."); return; }
+  document.getElementById("pdfName").textContent = file.name;
+  busy = true; setBuildStatus("Loading PDF engine…");
+  try{
+    const pdfjs = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.min.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.worker.min.mjs";
+    const buf = await file.arrayBuffer();
+    setBuildStatus("Reading pages…");
+    const doc = await pdfjs.getDocument({ data: buf }).promise;
+    let text = "";
+    for(let p=1; p<=doc.numPages; p++){
+      const page = await doc.getPage(p);
+      const content = await page.getTextContent();
+      text += content.items.map(i=>i.str).join(" ") + "\n";
+      if(p % 3 === 0) setBuildStatus(`Reading page ${p}/${doc.numPages}…`);
+    }
+    text = text.replace(/\s+/g, " ").trim();
+    if(!text){ setBuildStatus("No extractable text (scanned PDF?). Try a text-based PDF."); busy=false; return; }
+    // chunk into ~6000-char sections; decompose each into facts
+    const chunks = [];
+    for(let i=0; i<text.length; i+=6000) chunks.push(text.slice(i, i+6000));
+    let total = 0;
+    for(let ci=0; ci<chunks.length; ci++){
+      setBuildStatus(`Extracting facts from section ${ci+1}/${chunks.length}…`);
+      const prompt = `Extract atomic facts from this document section (from "${file.name}"). Each self-contained, one idea, useful for later recall.
+SECTION:\n${chunks[ci]}
+Return ONLY JSON: {"facts":[{"text":"...","category":"identity|ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low"}]}`;
+      try{
+        const raw = await claude([{ role:"user", content: prompt }], { model: settings.planModel, maxTokens: 3000 });
+        const cards = (parseJSON(raw).facts) || [];
+        total += await addFacts(cards, "pdf:"+file.name.slice(0,30), setBuildStatus);
+      }catch(e){ setBuildStatus(`Section ${ci+1} skipped: ${e.message}`); }
+    }
+    setBuildStatus(`Imported ${total} facts from ${file.name} (${doc.numPages} pages).`);
+  }catch(e){ setBuildStatus("PDF import failed: "+e.message); }
+  busy = false; render();
+}
+window.ingestPdf = ingestPdf;
 function setBuildStatus(t){ const el=document.getElementById("buildStatus"); if(el) el.textContent=t; }
 
 // ── reflection ──
@@ -807,7 +1010,7 @@ async function initModels(){
 
 // ── export / import ──
 function exportAll(){
-  const blob = new Blob([JSON.stringify({ facts, profile, sessions, gaps, reflect }, null, 1)], { type:"application/json" });
+  const blob = new Blob([JSON.stringify({ facts, profile, sessions, gaps, reflect, reports }, null, 1)], { type:"application/json" });
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
   a.download = "nous-backup.json"; a.click();
 }
@@ -818,6 +1021,8 @@ function importAll(ev){
     const d = JSON.parse(r.result);
     if(d.facts){ facts = d.facts; save(LS.facts, facts); }
     if(d.profile){ profile = d.profile; save(LS.profile, profile); }
+    if(d.reports){ reports = d.reports; save(LS.reports, reports); }
+    if(d.reflect){ reflect = d.reflect; save(LS.reflect, reflect); }
     alert("Imported ✓"); render();
   }catch(e){ alert("Import failed: "+e.message); } };
   r.readAsText(file);
@@ -892,6 +1097,11 @@ function renderTab(){
       <div class="muted" style="margin:4px 0 10px;">e.g. "my trip to Porto Cheli next week", "TOPENS AD5 gate opener troubleshooting", "raising turkeys in Alberta winters".</div>
       <div style="display:flex;gap:8px;"><input type="text" id="topicIn" placeholder="Topic…" style="flex:1;">
       <button class="btn" onclick="learnTopic()" ${busy?"disabled":""}>Go</button></div>
+    </div>
+    <div class="card"><div class="display" style="font-size:18px;color:#E8B84B;">Import a PDF</div>
+      <div class="muted" style="margin:4px 0 10px;">Drop a manual, lease, itinerary or report. NOUS extracts the text and Claude decomposes it into atomic facts for offline recall. Large PDFs are processed in sections.</div>
+      <label class="btn" style="display:inline-block;">Choose PDF<input type="file" accept="application/pdf" style="display:none;" onchange="ingestPdf(event)"></label>
+      <span id="pdfName" class="muted" style="margin-left:8px;"></span>
     </div>
     <div class="status" id="buildStatus"></div>`;
   }
@@ -982,6 +1192,8 @@ function renderTab(){
       <div class="lbl" style="margin-top:10px;">Data proxy URL (Cloudflare Worker)</div>
       <input type="text" id="setProxy" value="${esc(settings.proxyUrl)}" placeholder="https://…workers.dev/">
       <div class="muted" style="margin-top:6px;">Routes your Worker provides: web search, stock quotes (/quote), economic data (/macro), country data (/country), weather (/weather). Stock &amp; macro data auto-attach to research and chat when you ask about a ticker or the economy. <button class="btn ghost" style="padding:4px 10px;font-size:12px;margin-top:6px;" onclick="testProxy()">Test data routes</button></div>
+      <div class="lbl" style="margin-top:10px;">Proxy shared secret (optional — must match Worker)</div>
+      <input type="password" id="setSecret" value="${esc(settings.proxySecret||"")}" placeholder="a secret phrase">
       <div id="proxyTest" class="muted" style="margin-top:6px;"></div>
       <button class="btn" style="margin-top:12px;width:100%;" onclick="saveSettings()">Save</button>
     </div>
@@ -1003,10 +1215,12 @@ function renderTab(){
         <button class="btn ghost" onclick="exportAll()">Export everything</button>
         <button class="btn ghost" onclick="clearChat()">New chat session</button>
       </div>
-      <div class="muted" style="margin-top:8px;">${facts.length} facts · ${sessions.length} sessions · ${APP_VERSION}</div>
+      <div class="muted" style="margin-top:8px;">${facts.filter(f=>f.status!=="superseded").length} active facts · ${facts.filter(f=>f.status==="superseded").length} archived · ${sessions.length} sessions · ${APP_VERSION}</div>
+      <div id="storageMeter" class="muted" style="margin-top:6px;">Checking storage…</div>
     </div>`;
   }
   $("main").innerHTML = h;
+  if(tab==="set" && typeof updateStorageMeter==="function") updateStorageMeter();
 }
 
 function mdToHtml(md){
@@ -1020,6 +1234,23 @@ function mdToHtml(md){
   h = h.replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');
   return h;
 }
+async function updateStorageMeter(){
+  const el = document.getElementById("storageMeter"); if(!el) return;
+  try{
+    let line = "";
+    if(navigator.storage && navigator.storage.estimate){
+      const est = await navigator.storage.estimate();
+      const mb = n => (n/1048576).toFixed(0);
+      line += `Storage: ${mb(est.usage||0)} MB used of ${mb(est.quota||0)} MB available.`;
+    }
+    if(navigator.storage && navigator.storage.persisted){
+      const p = await navigator.storage.persisted();
+      line += ` Persistent: ${p?"yes \u2713 (protected from eviction)":"no \u2014 may be purged under pressure"}`;
+    }
+    el.textContent = line || "Storage info unavailable.";
+  }catch(e){ el.textContent = "Storage info unavailable."; }
+}
+window.updateStorageMeter = updateStorageMeter;
 window.testProxy = async () => {
   const el = document.getElementById("proxyTest");
   el.textContent = "Testing all routes\u2026";
@@ -1142,6 +1373,7 @@ window.saveSettings = () => {
   settings.apiKey = $("setKey").value.trim();
   settings.route = $("setRoute").value;
   if($("setProxy")) settings.proxyUrl = $("setProxy").value.trim();
+  if($("setSecret")) settings.proxySecret = $("setSecret").value.trim();
   settings.webllmModel = $("setModel") ? $("setModel").value : settings.webllmModel;
   settings.ttsRate = parseFloat($("setRate")?.value||"1.0");
   save(LS.settings, settings);
@@ -1158,16 +1390,21 @@ window.addEventListener("online", render);
 window.addEventListener("offline", render);
 if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
 
-// nightly reflection nudge: if online, key set, >24h since last run and there are gaps/chats
-if(navigator.onLine && settings.apiKey && Date.now()-reflect.lastRun > 86400000 &&
-   (gaps.length>2 || sessions.length>3)){
-  setTimeout(()=>{ if(tab==="chat" && session.turns.length===0){
-    session.turns.push({ role:"ai", via:"reflection nudge",
-      text:"It's been a while since I reflected on our conversations — open the Reflect tab and I'll propose what to learn next.", ts:Date.now() });
-    render(); } }, 1500);
-}
-
-render();
+// Boot: load storage (async), then render. Show a tiny loading state first.
+document.getElementById("main").innerHTML = '<div class="muted" style="padding:24px;">Loading your knowledge base…</div>';
+initStorage().then(() => {
+  render();
+  // nightly reflection nudge
+  if(navigator.onLine && settings.apiKey && Date.now()-reflect.lastRun > 86400000 &&
+     (gaps.length>2 || sessions.length>3)){
+    setTimeout(()=>{ if(tab==="chat" && session.turns.length===0){
+      session.turns.push({ role:"ai", via:"reflection nudge",
+        text:"It's been a while since I reflected on our conversations — open the Reflect tab and I'll propose what to learn next.", ts:Date.now() });
+      render(); } }, 1500);
+  }
+}).catch(e => {
+  document.getElementById("main").innerHTML = '<div class="card">Storage failed to load: '+e.message+'</div>';
+});
 </script>
 </body>
 </html>
