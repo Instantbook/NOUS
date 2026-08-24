@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v3i";
+const APP_VERSION = "v3j";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -167,9 +167,12 @@ async function initStorage(){
     if(idbGet){
       try{ const v = await idbGet(k); if(v !== undefined) return v; }catch(e){}
     }
-    // one-time migration from old localStorage (or fallback if idb unavailable)
+    // one-time migration from old localStorage (or fallback if idb unavailable).
+    // We AWAIT the idb write then delete the localStorage copy: leaving it behind
+    // meant an idb miss (eviction/failed write) silently rolled the app back to a
+    // frozen pre-v3e snapshot — old settings, old model, old facts.
     try{ const ls = localStorage.getItem(k); if(ls != null){ const parsed = JSON.parse(ls);
-      if(idbSet) idbSet(k, parsed).catch(()=>{});   // copy into idb
+      if(idbSet){ try{ await idbSet(k, parsed); localStorage.removeItem(k); }catch(e){} }
       return parsed; } }catch(e){}
     return fb;
   };
@@ -504,12 +507,25 @@ async function getEngine(status){
   if(engineLoading) throw new Error("Model still loading");
   engineLoading = true;
   try{
+    // switching models: release the previous weights first, or the phone holds
+    // two multi-hundred-MB models and Safari kills the tab
+    if(engine && engineModel !== settings.webllmModel){
+      if(status) status("Releasing previous model…");
+      try{ if(engine.unload) await engine.unload(); }catch(e){ console.error("unload", e); }
+      engine = null; engineModel = null;
+    }
     if(status) status("Loading chat model — first time downloads weights…");
     const { CreateMLCEngine } = await import("https://esm.run/@mlc-ai/web-llm");
-    engine = await CreateMLCEngine(settings.webllmModel, {
+    const wanted = settings.webllmModel;
+    engine = await CreateMLCEngine(wanted, {
       initProgressCallback: p => { if(status) status(p.text||"loading…", p.progress); }
     });
-    engineModel = settings.webllmModel;
+    engineModel = wanted;
+    // remember what's actually on disk so Settings can mark it
+    if(!Array.isArray(settings.webllmDownloaded)) settings.webllmDownloaded = [];
+    if(!settings.webllmDownloaded.includes(wanted)){
+      settings.webllmDownloaded.push(wanted); save(LS.settings, settings);
+    }
     return engine;
   } finally { engineLoading = false; }
 }
@@ -1117,19 +1133,39 @@ function acceptProfile(){
     reflect.updatedProfile = null; save(LS.reflect, reflect); renderTab(); }
 }
 
+// Read every Settings control currently on screen into `settings`. Called before
+// any action that re-renders or loads a model, so an unsaved dropdown change is
+// never silently discarded (the old Download button read the SAVED model, not the
+// selected one, so picking a bigger model then tapping Download re-fetched the old).
+function captureSettingsFields(){
+  if(tab !== "set") return;
+  if($("setKey"))    settings.apiKey      = $("setKey").value.trim();
+  if($("setRoute"))  settings.route       = $("setRoute").value;
+  if($("setProxy"))  settings.proxyUrl    = $("setProxy").value.trim();
+  if($("setSecret")) settings.proxySecret = $("setSecret").value.trim();
+  if($("setModel"))  settings.webllmModel = $("setModel").value;
+  if($("setVoice"))  settings.ttsVoice    = $("setVoice").value;
+  if($("setRate"))   settings.ttsRate     = parseFloat($("setRate").value||"1.0");
+  if($("setPitch"))  settings.ttsPitch    = parseFloat($("setPitch").value||"1.0");
+}
+function commitSettings(){ captureSettingsFields(); settings.savedAt = Date.now(); save(LS.settings, settings); }
+
 // ── models preload (Settings) ──
 async function initModels(){
+  commitSettings();                 // honour the dropdown selection, not the stale saved one
   busy = true;
   const status = (t,p)=>{ const el=document.getElementById("modelStatus"); if(el) el.textContent=t;
     const bar=document.getElementById("modelProg");
     if(bar){ bar.style.display="block"; if(p!==undefined) bar.firstElementChild.style.width=Math.round(p*100)+"%"; } };
+  const label = (WEBLLM_MODELS.find(m=>m.id===settings.webllmModel)||{}).label || settings.webllmModel;
   try{
     await getEmbedder(status);
     status("Embedding model ready ✓");
-    if(webgpuOK()){ await getEngine(status); status("All models ready ✓ — offline chat is live."); }
+    if(webgpuOK()){ await getEngine(status); status(`Ready ✓ — ${label} is loaded and cached for offline.`); }
     else status("Embedding ready ✓ — but no WebGPU on this browser, so offline chat is unavailable (retrieval + online chat still work).");
   }catch(e){ status("Failed: "+e.message); }
   busy = false;
+  renderTab();
 }
 
 // ── export / import ──
@@ -1355,13 +1391,19 @@ function renderTab(){
       <div id="proxyTest" class="muted" style="margin-top:6px;"></div>
       <button class="btn" style="margin-top:12px;width:100%;" onclick="saveSettings()">Save</button>
     </div>
-    <div class="card"><div class="lbl">Offline chat model (WebLLM)</div>
-      <select id="setModel">${WEBLLM_MODELS.map(m=>`<option value="${m.id}" ${settings.webllmModel===m.id?"selected":""}>${m.label}</option>`).join("")}</select>
-      <button class="btn sec" style="margin-top:12px;width:100%;" onclick="initModels()" ${busy?"disabled":""}>Download & initialize models</button>
-      <div class="status" id="modelStatus">${webgpuOK()?"WebGPU available ✓":"⚠ No WebGPU in this browser — offline chat unavailable (needs iOS 26+ Safari or Chrome)"}</div>
+    </div>`;
+    // ── Offline model card (selection persists on change, not on Save) ──
+    const dl = Array.isArray(settings.webllmDownloaded) ? settings.webllmDownloaded : [];
+    const selModel = WEBLLM_MODELS.find(m=>m.id===settings.webllmModel) || WEBLLM_MODELS[0];
+    const activeModel = engineModel ? (WEBLLM_MODELS.find(m=>m.id===engineModel)||{label:engineModel}).label : null;
+    const needsDownload = !dl.includes(settings.webllmModel);
+    h += `<div class="card"><div class="lbl">Offline chat model (WebLLM)</div>
+      <select id="setModel" onchange="setWebllmModel(this.value)">${WEBLLM_MODELS.map(m=>`<option value="${m.id}" ${settings.webllmModel===m.id?"selected":""}>${dl.includes(m.id)?"\u2713 ":""}${m.label}</option>`).join("")}</select>
+      <div class="muted" style="margin-top:6px;">Selected: <b style="color:#E6EAF0;">${esc(selModel.label)}</b>${needsDownload?" \u2014 not downloaded yet":" \u2014 downloaded \u2713"}${activeModel?`<br>Loaded in memory: ${esc(activeModel)}`:""}</div>
+      <button class="btn ${needsDownload?"":"sec"}" style="margin-top:12px;width:100%;" onclick="initModels()" ${busy?"disabled":""}>${needsDownload?"Download & initialize this model":"Re-initialize models"}</button>
+      <div class="status" id="modelStatus">${webgpuOK()?"WebGPU available \u2713":"\u26a0 No WebGPU in this browser \u2014 offline chat unavailable (needs iOS 26+ Safari or Chrome)"}</div>
       <div class="prog" id="modelProg" style="display:none;"><div></div></div>
-      <div class="muted" style="margin-top:8px;">First download runs once and is cached for offline. Do it on wifi.</div>
-    </div>
+      <div class="muted" style="margin-top:8px;">Your choice saves the moment you pick it. Each model downloads once and is cached for offline \u2014 do it on wifi. \u2713 marks models already on this device.</div>
     </div>`;
     // ── Voice card (built separately so we can enumerate system voices) ──
     const vlist = loadVoices();
@@ -1401,6 +1443,7 @@ function renderTab(){
         <button class="btn ghost" onclick="clearChat()">New chat session</button>
       </div>
       <div class="muted" style="margin-top:8px;">${facts.filter(f=>f.status!=="superseded").length} active facts · ${facts.filter(f=>f.status==="superseded").length} archived · ${sessions.length} sessions · ${APP_VERSION}</div>
+      <div class="muted" style="margin-top:6px;">Settings last saved: ${settings.savedAt?new Date(settings.savedAt).toLocaleString():"not yet"}</div>
       <div id="storageMeter" class="muted" style="margin-top:6px;">Checking storage…</div>
     </div>`;
   }
@@ -1571,36 +1614,38 @@ window.exportAll = exportAll;
 window.importAll = importAll;
 window.deleteFact = deleteFact;
 window.renderTab = renderTab;
-window.saveSettings = () => {
-  settings.apiKey = $("setKey").value.trim();
-  settings.route = $("setRoute").value;
-  if($("setProxy")) settings.proxyUrl = $("setProxy").value.trim();
-  if($("setSecret")) settings.proxySecret = $("setSecret").value.trim();
-  settings.webllmModel = $("setModel") ? $("setModel").value : settings.webllmModel;
-  settings.ttsRate = parseFloat($("setRate")?.value||"1.0");
-  if($("setVoice")) settings.ttsVoice = $("setVoice").value;
-  if($("setPitch")) settings.ttsPitch = parseFloat($("setPitch").value||"1.0");
-  save(LS.settings, settings);
-  const el = $("modelStatus"); if(el) el.textContent = "Saved ✓";
-  render();
-};
 window.refreshVoices = () => {
+  captureSettingsFields(); commitSettings();
   loadVoices();
   // iOS often only populates the list after a first utterance
   if(!voiceList.length){ try{ speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); }catch(e){} }
   setTimeout(()=>{ loadVoices(); renderTab(); }, 350);
 };
 window.previewVoice = () => {
-  const sel = $("setVoice"); if(sel) settings.ttsVoice = sel.value;
-  if($("setRate")) settings.ttsRate = parseFloat($("setRate").value||"1.0");
-  if($("setPitch")) settings.ttsPitch = parseFloat($("setPitch").value||"1.0");
-  save(LS.settings, settings);
+  commitSettings();
   const was = settings.tts; settings.tts = true;
   speak("This is how I'll read your answers. Adjust the voice, speed and pitch until it sounds right.");
   settings.tts = was;
   setTimeout(()=>{ if(!voiceList.length){ loadVoices(); if(voiceList.length) renderTab(); } }, 400);
 };
-window.toggleTTS = () => { settings.tts = !settings.tts; save(LS.settings, settings); renderTab(); };
+window.setWebllmModel = async id => {
+  if(!WEBLLM_MODELS.some(m=>m.id===id)) return;
+  captureSettingsFields();
+  settings.webllmModel = id;
+  commitSettings();
+  // drop the old engine so we don't hold two models in memory on the phone
+  if(engine && engineModel !== id){
+    try{ if(engine.unload) await engine.unload(); }catch(e){}
+    engine = null; engineModel = null;
+  }
+  renderTab();
+};
+window.saveSettings = () => {
+  commitSettings();
+  const el = $("modelStatus"); if(el) el.textContent = "Saved ✓";
+  render();
+};
+window.toggleTTS = () => { captureSettingsFields(); settings.tts = !settings.tts; commitSettings(); renderTab(); };
 window.newChat = () => { if(busy) return; startSession(); tab="chat"; render(); };
 window.clearChat = window.newChat;                       // Settings button alias
 window.toggleChatMenu = () => { chatMenu = !chatMenu; renderTab(); };
