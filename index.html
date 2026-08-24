@@ -91,19 +91,33 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v3j";
+const APP_VERSION = "v3k";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
+// Ordered safest-first: iOS caps each web-content process well below device RAM,
+// so weight size — not the phone's total memory — is what decides survival.
+// `risk` drives the warning shown under the picker.
 const WEBLLM_MODELS = [
-  { id:"Qwen2.5-1.5B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 1.5B (default, ~950MB)" },
-  { id:"Llama-3.2-1B-Instruct-q4f16_1-MLC", label:"Llama 3.2 1B (lighter, ~700MB)" },
-  { id:"Qwen2.5-0.5B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 0.5B (smallest, ~400MB)" },
-  { id:"Qwen2.5-3B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 3B (~1.9GB — flagship phones only)" },
+  { id:"Llama-3.2-1B-Instruct-q4f16_1-MLC", label:"Llama 3.2 1B (~700MB \u2014 best balance on iPhone)", mb:700, risk:"ok" },
+  { id:"Qwen2.5-0.5B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 0.5B (~400MB \u2014 safest, weakest answers)", mb:400, risk:"safe" },
+  { id:"Qwen2.5-1.5B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 1.5B (~950MB \u2014 tight on iPhone)", mb:950, risk:"tight" },
+  { id:"Qwen2.5-3B-Instruct-q4f16_1-MLC", label:"Qwen 2.5 3B (~1.9GB \u2014 desktop browsers only)", mb:1900, risk:"desktop" },
 ];
+const modelInfo = id => WEBLLM_MODELS.find(m=>m.id===id) || { label:id, mb:0, risk:"ok" };
+
+// Memory profile. WebLLM allocates the KV cache for the FULL context window at
+// load time, so an oversized window costs hundreds of MB we never use — our
+// assembled prompt is only ~2.8K tokens. Pinning the window is the single
+// biggest lever we have short of a smaller model.
+function memProfile(){
+  return settings.lowMem
+    ? { ctx:2048, prefill:256, budget:1500, maxOut:220 }
+    : { ctx:4096, prefill:512, budget:2800, maxOut:300 };
+}
 const EMBED_MODEL = "Xenova/all-MiniLM-L6-v2";
 const SIM_THRESHOLD = 0.30;      // below this, retrieval counts as a gap
-const TOKEN_BUDGET = 2800;       // approx tokens for assembled offline prompt
+// TOKEN_BUDGET now comes from memProfile() so it always tracks the context window
 const approxTok = s => Math.ceil((s||"").length / 4);
 
 // ── storage: IndexedDB (via idb-keyval) with a synchronous in-memory cache ──
@@ -199,6 +213,14 @@ async function initStorage(){
   memCache[LS.facts]=facts; memCache[LS.profile]=profile; memCache[LS.sessions]=sessions;
   memCache[LS.gaps]=gaps; memCache[LS.settings]=settings; memCache[LS.reflect]=reflect;
   memCache[LS.reports]=reports;
+
+  // A marker left over from last launch means the process was killed mid-run
+  // (iOS jetsam) rather than closed cleanly. Capture it, then clear.
+  if(settings.activeRun){
+    lastCrash = { ...settings.activeRun };
+    delete settings.activeRun;
+    save(LS.settings, settings);
+  }
 
   // RESUME the most recent chat instead of always starting fresh (v3h).
   // iOS kills backgrounded PWAs constantly; a new session per launch meant the
@@ -461,7 +483,7 @@ async function retrieve(query, k=6, status){
 
 // ── context manager (the star): fill a fixed budget by priority ──
 function assembleOffline(question, hits, reportCtx, liveBlocks){
-  let budget = TOKEN_BUDGET - 350;               // reserve for the answer
+  let budget = memProfile().budget - 350;        // reserve for the answer
   const parts = [];
   // 1. profile (frozen, always in)
   const today = new Date().toDateString();
@@ -517,9 +539,24 @@ async function getEngine(status){
     if(status) status("Loading chat model — first time downloads weights…");
     const { CreateMLCEngine } = await import("https://esm.run/@mlc-ai/web-llm");
     const wanted = settings.webllmModel;
-    engine = await CreateMLCEngine(wanted, {
-      initProgressCallback: p => { if(status) status(p.text||"loading…", p.progress); }
-    });
+    const mp = memProfile();
+    const initCfg = { initProgressCallback: p => { if(status) status(p.text||"loading…", p.progress); } };
+    // Cap the KV cache to what we actually use. Without this WebLLM allocates the
+    // model's default window (often 4-32K tokens) up front — pure waste against a
+    // ~2.8K prompt, and the difference between loading and being jetsam-killed.
+    const chatOpts = { context_window_size: mp.ctx, prefill_chunk_size: mp.prefill };
+    markRun("loading "+modelInfo(wanted).label);
+    try{
+      engine = await CreateMLCEngine(wanted, initCfg, chatOpts);
+    }catch(e){
+      // only retry bare if the override itself was rejected — never after an OOM,
+      // where retrying with a bigger window would just fail harder
+      if(/unknown|invalid|unsupported|not a valid|chatopts|context_window|prefill/i.test(e.message||"")){
+        if(status) status("Retrying with default context settings…");
+        engine = await CreateMLCEngine(wanted, initCfg);
+      } else throw e;
+    }
+    clearRun();
     engineModel = wanted;
     // remember what's actually on disk so Settings can mark it
     if(!Array.isArray(settings.webllmDownloaded)) settings.webllmDownloaded = [];
@@ -529,23 +566,38 @@ async function getEngine(status){
     return engine;
   } finally { engineLoading = false; }
 }
+// ── crash breadcrumb ──
+// A jetsam kill gives us no error and no unload hook — the process simply dies.
+// So we write a marker before risky work and clear it after; a marker still
+// present at next boot means the previous run was killed, almost always OOM.
+let lastCrash = null;
+function markRun(phase){
+  settings.activeRun = { phase, model: settings.webllmModel, lowMem: !!settings.lowMem, ts: Date.now() };
+  save(LS.settings, settings);
+}
+function clearRun(){ if(settings.activeRun){ delete settings.activeRun; save(LS.settings, settings); } }
+
 async function localGenerate(system, messages, status, onToken){
   const eng = await getEngine(status);
-  if(onToken){
-    const chunks = await eng.chat.completions.create({
-      messages: [{ role:"system", content: system }, ...messages],
-      temperature: 0.6, max_tokens: 300, stream: true });
-    let full = "";
-    for await (const chunk of chunks){
-      const delta = chunk.choices?.[0]?.delta?.content || "";
-      if(delta){ full += delta; onToken(full); }
+  const mp = memProfile();
+  markRun("generating a reply");
+  try{
+    if(onToken){
+      const chunks = await eng.chat.completions.create({
+        messages: [{ role:"system", content: system }, ...messages],
+        temperature: 0.6, max_tokens: mp.maxOut, stream: true });
+      let full = "";
+      for await (const chunk of chunks){
+        const delta = chunk.choices?.[0]?.delta?.content || "";
+        if(delta){ full += delta; onToken(full); }
+      }
+      return full.trim();
     }
-    return full.trim();
-  }
-  const r = await eng.chat.completions.create({
-    messages: [{ role:"system", content: system }, ...messages],
-    temperature: 0.6, max_tokens: 300 });
-  return r.choices[0].message.content.trim();
+    const r = await eng.chat.completions.create({
+      messages: [{ role:"system", content: system }, ...messages],
+      temperature: 0.6, max_tokens: mp.maxOut });
+    return r.choices[0].message.content.trim();
+  } finally { clearRun(); }
 }
 
 // ── TTS ──
@@ -672,7 +724,17 @@ async function sendMsg(){
     speak(reply);
     streamEl = null;
   }catch(e){
-    session.turns.push({ role:"ai", text:"⚠ "+e.message, via:"error", ts:Date.now() });
+    let msg = "⚠ "+e.message;
+    // OOM surfaces as opaque WebGPU/allocation errors — translate it
+    if(!navigator.onLine || settings.route==="offline"){
+      if(/out of memory|allocat|device.*lost|webgpu|createBuffer|oom/i.test(e.message||"")){
+        const cm = modelInfo(settings.webllmModel);
+        msg = `⚠ The local model ran out of memory (${cm.label}).\n\n` +
+          (settings.lowMem ? "Low-memory mode is already on, so try a smaller model in ⚙ Settings."
+                           : "Turn on low-memory mode in ⚙ Settings, or pick a smaller model.");
+      }
+    }
+    session.turns.push({ role:"ai", text:msg, via:"error", ts:Date.now() });
     session.updated = Date.now();
     save(LS.sessions, sessions);
   }
@@ -1206,6 +1268,19 @@ function render(){
 function renderTab(){
   let h = "";
   if(tab==="chat"){
+    if(lastCrash){
+      const cm = modelInfo(lastCrash.model);
+      const smaller = WEBLLM_MODELS.find(m => m.mb < cm.mb) || WEBLLM_MODELS[1];
+      h += `<div class="card" style="border-color:#E89FB4;">
+        <div style="font-weight:700;color:#E89FB4;font-size:14.5px;">The app restarted unexpectedly</div>
+        <div class="muted" style="margin-top:6px;line-height:1.5;">It was ${esc(lastCrash.phase)} with <b>${esc(cm.label)}</b>${lastCrash.lowMem?" in low-memory mode":""}.
+        On iPhone this is almost always memory pressure \u2014 iOS kills the whole app rather than reporting an error.</div>
+        <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+          ${!lastCrash.lowMem?`<button class="btn" style="padding:8px 13px;font-size:13px;" onclick="enableLowMem()">Use low-memory mode</button>`:""}
+          ${cm.mb>smaller.mb?`<button class="btn sec" style="padding:8px 13px;font-size:13px;" onclick="stepDownModel()">Switch to ${esc(smaller.label.split(" (")[0])}</button>`:""}
+          <button class="btn ghost" style="padding:8px 13px;font-size:13px;" onclick="dismissCrash()">Dismiss</button>
+        </div></div>`;
+    }
     // session bar — current chat, history drawer, explicit new chat
     h += `<div class="card" style="padding:11px 13px;"><div class="row">
       <div style="min-width:0;">
@@ -1397,12 +1472,23 @@ function renderTab(){
     const selModel = WEBLLM_MODELS.find(m=>m.id===settings.webllmModel) || WEBLLM_MODELS[0];
     const activeModel = engineModel ? (WEBLLM_MODELS.find(m=>m.id===engineModel)||{label:engineModel}).label : null;
     const needsDownload = !dl.includes(settings.webllmModel);
+    const mp = memProfile();
+    const RISK = {
+      desktop:`<div class="gap" style="margin-top:10px;font-size:13px;">This model needs ~1.9GB and will not load on iPhone \u2014 iOS caps each app's web process far below that. Desktop browsers only.</div>`,
+      tight:`<div class="gap" style="margin-top:10px;font-size:13px;">~950MB is at the edge of what iOS allows a web app. If chat dies and the model reloads, that's the process being killed \u2014 switch on low-memory mode, or drop to Llama 3.2 1B.</div>`,
+      ok:"", safe:"" };
+    const riskNote = RISK[selModel.risk] || "";
     h += `<div class="card"><div class="lbl">Offline chat model (WebLLM)</div>
       <select id="setModel" onchange="setWebllmModel(this.value)">${WEBLLM_MODELS.map(m=>`<option value="${m.id}" ${settings.webllmModel===m.id?"selected":""}>${dl.includes(m.id)?"\u2713 ":""}${m.label}</option>`).join("")}</select>
       <div class="muted" style="margin-top:6px;">Selected: <b style="color:#E6EAF0;">${esc(selModel.label)}</b>${needsDownload?" \u2014 not downloaded yet":" \u2014 downloaded \u2713"}${activeModel?`<br>Loaded in memory: ${esc(activeModel)}`:""}</div>
       <button class="btn ${needsDownload?"":"sec"}" style="margin-top:12px;width:100%;" onclick="initModels()" ${busy?"disabled":""}>${needsDownload?"Download & initialize this model":"Re-initialize models"}</button>
       <div class="status" id="modelStatus">${webgpuOK()?"WebGPU available \u2713":"\u26a0 No WebGPU in this browser \u2014 offline chat unavailable (needs iOS 26+ Safari or Chrome)"}</div>
       <div class="prog" id="modelProg" style="display:none;"><div></div></div>
+      <div class="row" style="margin-top:12px;"><span style="font-size:14.5px;">Low-memory mode</span>
+        <button class="chip ${settings.lowMem?"on":""}" onclick="toggleLowMem()">${settings.lowMem?"On":"Off"}</button></div>
+      <div class="muted" style="margin-top:4px;">Shrinks the context window (${mp.ctx} tokens) and reply length. Cuts memory noticeably; answers get shorter and recall less history. Turn on if the app restarts mid-answer.</div>
+      ${riskNote}
+      <button class="btn ghost" style="margin-top:10px;width:100%;" onclick="freeMemory()" ${engineModel?"":"disabled"}>Release model from memory${engineModel?"":" (none loaded)"}</button>
       <div class="muted" style="margin-top:8px;">Your choice saves the moment you pick it. Each model downloads once and is cached for offline \u2014 do it on wifi. \u2713 marks models already on this device.</div>
     </div>`;
     // ── Voice card (built separately so we can enumerate system voices) ──
@@ -1628,16 +1714,37 @@ window.previewVoice = () => {
   settings.tts = was;
   setTimeout(()=>{ if(!voiceList.length){ loadVoices(); if(voiceList.length) renderTab(); } }, 400);
 };
+window.dismissCrash = () => { lastCrash = null; render(); };
+window.enableLowMem = () => {
+  settings.lowMem = true; commitSettings(); lastCrash = null;
+  // the running engine was built with the old context window — drop it
+  freeEngine().then(render);
+};
+window.stepDownModel = async () => {
+  const cur = modelInfo(settings.webllmModel);
+  const smaller = WEBLLM_MODELS.find(m => m.mb < cur.mb) || WEBLLM_MODELS[1];
+  lastCrash = null;
+  await window.setWebllmModel(smaller.id);
+  tab = "set"; render();
+};
+window.toggleLowMem = () => { captureSettingsFields(); settings.lowMem = !settings.lowMem;
+  commitSettings(); freeEngine().then(renderTab); };
+async function freeEngine(){
+  if(engine){ try{ if(engine.unload) await engine.unload(); }catch(e){} }
+  engine = null; engineModel = null;
+}
+window.freeMemory = async () => {
+  await freeEngine();
+  const el = $("modelStatus"); if(el) el.textContent = "Model released from memory ✓ (reloads from cache on next offline question)";
+  renderTab();
+};
 window.setWebllmModel = async id => {
   if(!WEBLLM_MODELS.some(m=>m.id===id)) return;
   captureSettingsFields();
   settings.webllmModel = id;
   commitSettings();
   // drop the old engine so we don't hold two models in memory on the phone
-  if(engine && engineModel !== id){
-    try{ if(engine.unload) await engine.unload(); }catch(e){}
-    engine = null; engineModel = null;
-  }
+  if(engine && engineModel !== id) await freeEngine();
   renderTab();
 };
 window.saveSettings = () => {
