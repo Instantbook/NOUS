@@ -91,7 +91,7 @@
 // Online: Claude builds the knowledge base (atomic facts + embeddings)
 // Offline: local retrieval + context manager + WebLLM (~1.5B) voice
 // ════════════════════════════════════════════════════════════════
-const APP_VERSION = "v3h";
+const APP_VERSION = "v3i";
 const LS = { facts:"nous.facts", profile:"nous.profile", sessions:"nous.sessions",
              gaps:"nous.gaps", settings:"nous.settings", reflect:"nous.reflect", reports:"nous.reports" };
 
@@ -184,7 +184,7 @@ async function initStorage(){
 
   // settings defaults / migrations
   const sd = { apiKey:"", claudeModel:"claude-sonnet-5", planModel:"claude-haiku-4-5-20251001",
-    webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, route:"auto",
+    webllmModel:WEBLLM_MODELS[0].id, tts:true, ttsRate:1.0, ttsVoice:"", ttsPitch:1.0, route:"auto",
     proxyUrl:"https://curly-term-5539.dbazos1.workers.dev/", researchDepth:2 };
   settings = Object.assign({}, sd, settings);
   if(!settings.proxyUrl) settings.proxyUrl = sd.proxyUrl;
@@ -347,6 +347,35 @@ function parseJSON(raw){
   }
 }
 
+// Pull complete {...} objects out of a (possibly truncated) JSON array.
+// Brace-depth scan that respects strings/escapes, so a response cut off at
+// max_tokens still yields every fact that finished serializing.
+function salvageObjects(text){
+  const out = []; let depth=0, start=-1, inStr=false, esc=false;
+  for(let i=0;i<text.length;i++){
+    const ch = text[i];
+    if(inStr){ if(esc) esc=false; else if(ch==="\\") esc=true; else if(ch==='"') inStr=false; continue; }
+    if(ch==='"'){ inStr=true; continue; }
+    if(ch==="{"){ if(depth===0) start=i; depth++; }
+    else if(ch==="}"){ if(depth>0){ depth--;
+      if(depth===0 && start>=0){ try{ out.push(JSON.parse(text.slice(start,i+1))); }catch(e){} start=-1; } } }
+  }
+  return out;
+}
+// Card arrays are the one thing we must never lose to a parse error.
+function parseCards(raw, key){
+  try{
+    const o = parseJSON(raw);
+    if(o && Array.isArray(o[key]) && o[key].length) return o[key];
+    if(Array.isArray(o) && o.length) return o;
+  }catch(e){}
+  const clean = String(raw||"").replace(/```json|```/g,"");
+  const ki = clean.indexOf('"'+key+'"');
+  const from = ki>=0 ? clean.indexOf("[", ki) : clean.indexOf("[");
+  if(from < 0) return [];
+  return salvageObjects(clean.slice(from+1)).filter(o => o && typeof o.text === "string");
+}
+
 // ── fact store ──
 async function addFacts(cards, source, status){
   let added = 0;
@@ -362,13 +391,18 @@ async function addFacts(cards, source, status){
       }
     }
     if(status) status(`Embedding ${added+1}/${cards.length}…`);
-    const vec = await embedText(c.text, status);
-    facts.push({ id:Date.now()+Math.random(), text:c.text.trim(),
-      category:["identity","ambient","interest","episodic","procedure"].includes(c.category)?c.category:"episodic",
-      aliases:Array.isArray(c.aliases)?c.aliases.slice(0,8):[],
-      source, confidence:c.confidence||"medium", status:"active",
-      created:Date.now(), verified:Date.now(), emb:encVec(vec) });
-    added++;
+    try{
+      const vec = await embedText(c.text, status);
+      facts.push({ id:Date.now()+Math.random(), text:c.text.trim(),
+        category:["identity","ambient","interest","episodic","procedure"].includes(c.category)?c.category:"episodic",
+        aliases:Array.isArray(c.aliases)?c.aliases.slice(0,8):[],
+        source, confidence:c.confidence||"medium", status:"active",
+        created:Date.now(), verified:Date.now(), emb:encVec(vec) });
+      added++;
+    }catch(e){
+      // one bad fact must not discard the whole batch
+      console.error("embed failed", c.text?.slice(0,60), e);
+    }
   }
   save(LS.facts, facts);
   return added;
@@ -415,9 +449,11 @@ async function retrieve(query, k=6, status){
     const kw = keywordScore(qTokens, f);
     return { f, cos, kw, s: 0.7*cos + 0.3*Math.min(kw,1) };
   }).sort((a,b)=>b.s-a.s);
-  // keep a hit if hybrid clears threshold OR keyword match is strong (exact string found)
-  const hits = scored.slice(0, k).filter(x=>x.s >= SIM_THRESHOLD || x.kw >= 0.75);
-  return { hits, best: scored[0]?.s || 0 };
+  // Hybrid score RANKS. The gate uses raw cosine (what SIM_THRESHOLD was tuned
+  // for) or a solid keyword hit — v3g gated on the blended score, which silently
+  // raised the effective cosine bar from 0.30 to 0.43 and buried good facts.
+  const hits = scored.slice(0, k).filter(x => x.cos >= SIM_THRESHOLD || x.kw >= 0.5);
+  return { hits, best: scored[0]?.cos || 0 };
 }
 
 // ── context manager (the star): fill a fixed budget by priority ──
@@ -497,11 +533,33 @@ async function localGenerate(system, messages, status, onToken){
 }
 
 // ── TTS ──
+// iOS populates getVoices() asynchronously and often only after the first
+// speak(), so we cache, listen for voiceschanged, and re-render Settings.
+let voiceList = [];
+function loadVoices(){
+  try{ voiceList = (speechSynthesis.getVoices()||[]).filter(v=>v && v.name); }catch(e){ voiceList = []; }
+  return voiceList;
+}
+function pickVoice(){
+  const list = voiceList.length ? voiceList : loadVoices();
+  if(!settings.ttsVoice) return null;
+  return list.find(v => v.voiceURI===settings.ttsVoice) ||
+         list.find(v => v.name===settings.ttsVoice) || null;
+}
+try{
+  loadVoices();
+  if(typeof speechSynthesis !== "undefined")
+    speechSynthesis.addEventListener("voiceschanged", () => { loadVoices(); if(tab==="set") renderTab(); });
+}catch(e){}
+
 function speak(text){
   if(!settings.tts) return;
   try{ speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
     u.rate = settings.ttsRate || 1.0;
+    u.pitch = (settings.ttsPitch===undefined) ? 1.0 : settings.ttsPitch;
+    const v = pickVoice();
+    if(v){ u.voice = v; if(v.lang) u.lang = v.lang; }
     speechSynthesis.speak(u);
   }catch(e){}
 }
@@ -792,6 +850,37 @@ function rlog(msg){ research.log.push(msg);
   try{ localStorage.setItem("nous.lastlog", JSON.stringify(research.log)); }catch(e){}
   if(tab==="research") renderTab(); }
 
+// Turn a saved report into offline fact-cards. Chunked (long reports blew the
+// old single 3000-token call and truncated the JSON), salvage-tolerant, and it
+// returns the number ACTUALLY embedded rather than the number requested.
+async function extractReportFacts(rec, log){
+  const text = rec.report || "";
+  const chunks = [];
+  for(let i=0; i<text.length; i+=9000) chunks.push(text.slice(i, i+9000));
+  let total = 0, parsedCards = 0;
+  for(let ci=0; ci<chunks.length; ci++){
+    if(log) log(`Extracting facts — section ${ci+1}/${chunks.length}…`);
+    let cards = [];
+    try{
+      const raw = await claude([{ role:"user", content:
+`Extract atomic facts from this research report section for an offline knowledge base.
+Each fact: self-contained, ONE idea, meaningful without the report. Keep concrete figures, dates, names,
+and note where sources disagree. Aim for 12-25 facts. Prefer fewer complete facts over many truncated ones.
+REPORT SECTION (from "${rec.topic}"):\n${chunks[ci]}
+Return ONLY JSON: {"facts":[{"text":"...","category":"episodic|interest|procedure","aliases":["..."],"confidence":"high|medium|low"}]}` }],
+        { model: settings.planModel, maxTokens: 8000 });
+      cards = parseCards(raw, "facts");
+    }catch(e){ if(log) log(`  section ${ci+1} failed: ${e.message}`); continue; }
+    if(!cards.length){ if(log) log(`  section ${ci+1}: nothing parsed.`); continue; }
+    parsedCards += cards.length;
+    const n = await addFacts(cards, "research-report");
+    total += n;
+    if(log) log(`  section ${ci+1}: ${n} of ${cards.length} stored${n<cards.length?" (rest were duplicates)":""}.`);
+  }
+  if(log && parsedCards && !total) log("  all facts were already in your knowledge base.");
+  return total;
+}
+
 async function runResearch(question, depth){
   if(!settings.apiKey){ alert("Add your Anthropic API key in Settings first."); return; }
   if(!navigator.onLine){ alert("Research needs an internet connection."); return; }
@@ -863,24 +952,19 @@ Return ONLY JSON: {"followups":[{"query":"...","fresh":true|false}]}` }],
 `Research question: "${question}"\n\nGATHERED EVIDENCE:\n${corpus}\n\nWrite the report now.` }],
       { system: sys, maxTokens: 4000 });
 
-    // decompose into fact-cards for offline recall
-    rlog("Decomposing into offline facts…");
-    let factCards = [];
-    try{
-      const factRaw = await claude([{ role:"user", content:
-`From this research report, extract 15-30 atomic facts for an offline knowledge base. Each self-contained, one idea.
-REPORT:\n${report.slice(0, 12000)}
-Return ONLY JSON: {"facts":[{"text":"...","category":"episodic|interest|procedure","aliases":["..."],"confidence":"high|medium|low"}]}` }],
-        { model: settings.planModel, maxTokens: 3000 });
-      const parsed = parseJSON(factRaw);
-      factCards = (parsed && parsed.facts) || [];
-    }catch(e){ rlog("(fact extraction skipped: "+e.message+") — report is still saved."); factCards = []; }
-
     const rec = { id:Date.now(), question, topic:plan.topic||question.slice(0,40),
-      report, created:Date.now(), searches:evidence.length, factCount:factCards.length };
-    reports.unshift(rec); save(LS.reports, reports);
-    if(factCards.length){ rlog(`Embedding ${factCards.length} facts…`);
-      await addFacts(factCards, "research-report"); }
+      report, created:Date.now(), searches:evidence.length, factCount:0 };
+    reports.unshift(rec); save(LS.reports, reports);   // save BEFORE extraction — never lose the report
+
+    rlog("Decomposing into offline facts…");
+    try{
+      rec.factCount = await extractReportFacts(rec, rlog);
+      save(LS.reports, reports);
+      rlog(rec.factCount ? `Stored ${rec.factCount} facts — offline recall ready.`
+                         : "No facts extracted — use “Re-extract facts” on the report to retry.");
+    }catch(e){
+      rlog("Fact extraction failed: "+e.message+" — report saved; tap “Re-extract facts” to retry.");
+    }
     research = { running:false, log:research.log, report:rec };
     rlog("Done.");
   }catch(e){
@@ -908,8 +992,8 @@ Name: ${info.name}\nHome: ${info.home}\nCurrent location: ${info.now}\nWork/proj
 
 For the ambient layer, use web search to also add ~10 practical facts about their current location (emergency number, main hospital, timezone, climate now, key local practicalities).
 ${DECOMPOSE_RULES}`;
-    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:4000 });
-    const out = parseJSON(raw);
+    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:8000 });
+    let out = {}; try{ out = parseJSON(raw) || {}; }catch(e){}
     profile.text = out.profile || profile.text;
     profile.name = info.name; profile.location = info.now || info.home;
     // resolve home/current location to coordinates for weather fallback
@@ -919,7 +1003,8 @@ ${DECOMPOSE_RULES}`;
         if(g && !g.error){ profile.lat = g.lat; profile.lon = g.lon; profile.location = `${g.name}${g.country?", "+g.country:""}`; } }
     }catch(e){}
     save(LS.profile, profile);
-    const n = await addFacts(out.facts||[], "onboarding", setBuildStatus);
+    const cards = (Array.isArray(out.facts) && out.facts.length) ? out.facts : parseCards(raw, "facts");
+    const n = await addFacts(cards, "onboarding", setBuildStatus);
     setBuildStatus(`Done — profile set, ${n} facts stored.`);
   }catch(e){ setBuildStatus("Failed: "+e.message); }
   busy = false; render();
@@ -936,10 +1021,12 @@ async function learnTopic(){
 User profile for context: ${profile.text||"(none)"}
 Use web search for anything current. Be anticipatory: cover the adjacent sub-questions they'll likely ask, not just the literal topic. Aim for 15-30 facts.
 Return ONLY JSON: {"facts":[{"text":"...","category":"ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low","replaces":["exact text of any outdated fact this updates"]}]}`;
-    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:4000 });
-    const out = parseJSON(raw);
-    const n = await addFacts(out.facts||[], "research", setBuildStatus);
-    setBuildStatus(`Stored ${n} facts on "${topic}" — available offline now.`);
+    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:8000 });
+    const cards = parseCards(raw, "facts");
+    if(!cards.length) throw new Error("Claude returned no parseable facts — try rephrasing the topic.");
+    const n = await addFacts(cards, "research", setBuildStatus);
+    setBuildStatus(n ? `Stored ${n} facts on "${topic}" — available offline now.`
+                     : `Nothing new stored on "${topic}" (all ${cards.length} facts were already known).`);
     document.getElementById("topicIn").value = "";
   }catch(e){ setBuildStatus("Failed: "+e.message); }
   busy = false; render();
@@ -974,8 +1061,8 @@ async function ingestPdf(ev){
 SECTION:\n${chunks[ci]}
 Return ONLY JSON: {"facts":[{"text":"...","category":"identity|ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low"}]}`;
       try{
-        const raw = await claude([{ role:"user", content: prompt }], { model: settings.planModel, maxTokens: 3000 });
-        const cards = (parseJSON(raw).facts) || [];
+        const raw = await claude([{ role:"user", content: prompt }], { model: settings.planModel, maxTokens: 8000 });
+        const cards = parseCards(raw, "facts");
         total += await addFacts(cards, "pdf:"+file.name.slice(0,30), setBuildStatus);
       }catch(e){ setBuildStatus(`Section ${ci+1} skipped: ${e.message}`); }
     }
@@ -1002,8 +1089,9 @@ Tasks: 1) Find topics recurring across MULTIPLE sessions (ignore one-offs). 2) C
 
 Return ONLY JSON: {"themes":["..."],"updatedProfile":"string or null",
 "proposals":[{"text":"...","category":"ambient|interest|episodic|procedure","aliases":["..."],"confidence":"high|medium|low","reason":"why this helps"}]}`;
-    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:4000 });
-    const out = parseJSON(raw);
+    const raw = await claude([{ role:"user", content: prompt }], { webSearch:true, maxTokens:8000 });
+    let out = {}; try{ out = parseJSON(raw) || {}; }catch(e){}
+    if(!Array.isArray(out.proposals) || !out.proposals.length) out.proposals = parseCards(raw, "proposals");
     reflect = { lastRun: Date.now(), themes: out.themes||[],
                 updatedProfile: out.updatedProfile||null,
                 proposals: (out.proposals||[]).map(p=>({ ...p, id:Date.now()+Math.random() })) };
@@ -1129,7 +1217,7 @@ function renderTab(){
 
   if(tab==="know"){
     h += `<div class="card"><div class="row">
-      <input type="text" id="knowFilter" placeholder="Filter facts…" oninput="renderTab()" style="flex:1;">
+      <input type="text" id="knowFilter" placeholder="Filter by text, category or source…" oninput="renderTab()" style="flex:1;">
       </div>
       <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
         <button class="btn ghost" onclick="exportAll()">Export backup</button>
@@ -1138,7 +1226,8 @@ function renderTab(){
     if(profile.text) h += `<div class="card"><div class="lbl">Standing profile (in every offline prompt)</div>
       <div style="font-size:14px;line-height:1.55;">${esc(profile.text)}</div></div>`;
     const filt = ($("knowFilter")?.value||"").toLowerCase();
-    const list = facts.filter(f=>!filt || f.text.toLowerCase().includes(filt) || f.category.includes(filt));
+    const list = facts.filter(f=>!filt || f.text.toLowerCase().includes(filt)
+      || f.category.includes(filt) || (f.source||"").toLowerCase().includes(filt));
     h += `<div class="muted" style="margin-top:12px;">${list.length} of ${facts.length} facts</div>`;
     for(const f of [...list].sort((a,b)=>b.created-a.created).slice(0,200)){
       h += `<div class="fact"><div class="row"><div style="min-width:0;">
@@ -1224,10 +1313,12 @@ function renderTab(){
       h += `<div class="card">
         <div class="display" style="font-size:17px;color:#E8B84B;">${esc(r.topic)}</div>
         <div class="muted" style="margin:4px 0 10px;">${r.searches} searches \u00b7 ${r.factCount} facts stored offline \u00b7 ${new Date(r.created).toLocaleDateString()}</div>
+        ${!r.factCount?`<div class="gap" style="margin-bottom:10px;font-size:13px;">No offline facts stored for this report \u2014 the local model can't discuss it yet. Tap <b>Re-extract facts</b> (online).</div>`:""}
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="closeReport()">\u2715 Close</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="speakReport(${r.id})">\u25b6 Read</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="discussReport(${r.id})">\ud83d\udcac Discuss</button>
+          <button class="btn ${r.factCount?"ghost":"sec"}" style="padding:7px 12px;font-size:13px;" onclick="reextractFacts(${r.id})" ${research.running?"disabled":""}>\ud83e\udde0 Re-extract facts</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="exportReportMd(${r.id})">\u2b07 .md</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;" onclick="exportReportPdf(${r.id})">\ud83d\udcc4 PDF</button>
           <button class="btn ghost" style="padding:7px 12px;font-size:13px;color:#E89FB4;border-color:#E89FB4;" onclick="deleteReport(${r.id})">\ud83d\uddd1 Delete</button>
@@ -1271,13 +1362,40 @@ function renderTab(){
       <div class="prog" id="modelProg" style="display:none;"><div></div></div>
       <div class="muted" style="margin-top:8px;">First download runs once and is cached for offline. Do it on wifi.</div>
     </div>
-    <div class="card"><div class="lbl">Voice</div>
+    </div>`;
+    // ── Voice card (built separately so we can enumerate system voices) ──
+    const vlist = loadVoices();
+    const vsorted = [...vlist].sort((a,b)=>{
+      const ae = /^en/i.test(a.lang||"")?0:1, be = /^en/i.test(b.lang||"")?0:1;
+      return ae-be || (a.lang||"").localeCompare(b.lang||"") || (a.name||"").localeCompare(b.name||"");
+    });
+    const curVoice = settings.ttsVoice || "";
+    const curPitch = String(settings.ttsPitch===undefined ? 1.0 : settings.ttsPitch);
+    h += `<div class="card"><div class="lbl">Voice</div>
       <div class="row"><span style="font-size:14.5px;">Read replies aloud (TTS)</span>
       <button class="chip ${settings.tts?"on":""}" onclick="toggleTTS()">${settings.tts?"On":"Off"}</button></div>
+      <div class="lbl" style="margin-top:10px;">Voice${vsorted.length?` (${vsorted.length} available)`:""}</div>
+      <select id="setVoice">
+        <option value="">System default</option>
+        ${vsorted.map(v=>{ const key=v.voiceURI||v.name;
+          return `<option value="${esc(key)}" ${curVoice===key?"selected":""}>${esc(v.name)} \u2014 ${esc(v.lang||"")}${v.localService===false?" (network)":""}</option>`;
+        }).join("")}
+      </select>
+      ${vsorted.length?"":`<div class="muted" style="margin-top:6px;">No voices reported yet \u2014 iOS loads them lazily. Tap Preview, then Refresh.</div>`}
       <div class="lbl" style="margin-top:10px;">Speed</div>
-      <select id="setRate">${[["0.8","Slow"],["1.0","Normal"],["1.2","Fast"]].map(([v,l])=>`<option value="${v}" ${String(settings.ttsRate)===v?"selected":""}>${l}</option>`).join("")}</select>
-    </div>
-    <div class="card"><div class="lbl">Data</div>
+      <select id="setRate">${[["0.7","Slowest"],["0.85","Slower"],["1.0","Normal"],["1.15","Faster"],["1.3","Fast"],["1.5","Fastest"]].map(([v,l])=>`<option value="${v}" ${String(settings.ttsRate)===v?"selected":""}>${l}</option>`).join("")}</select>
+      <div class="lbl" style="margin-top:10px;">Pitch</div>
+      <select id="setPitch">${[["0.8","Lower"],["1.0","Natural"],["1.2","Higher"]].map(([v,l])=>`<option value="${v}" ${curPitch===v?"selected":""}>${l}</option>`).join("")}</select>
+      <div style="display:flex;gap:6px;margin-top:12px;">
+        <button class="btn sec" style="flex:1;" onclick="previewVoice()">\u25b6 Preview</button>
+        <button class="btn ghost" style="flex:1;" onclick="refreshVoices()">\u21bb Refresh list</button>
+      </div>
+      <div class="muted" style="margin-top:10px;line-height:1.5;">The default is the compact system voice. For a much better one, download an
+      enhanced voice in <b>iOS Settings \u2192 Accessibility \u2192 Spoken Content \u2192 Voices \u2192 English</b>
+      (pick an <i>Enhanced</i> or <i>Premium</i> entry \u2014 Ava, Evan, Zoe, Samantha), then tap Refresh here.
+      Siri's own voices aren't exposed to web apps.</div>
+    </div>`;
+    h += `<div class="card"><div class="lbl">Data</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
         <button class="btn ghost" onclick="exportAll()">Export everything</button>
         <button class="btn ghost" onclick="clearChat()">New chat session</button>
@@ -1412,6 +1530,22 @@ window.discussReport = id => {
     text:`Let's dig into "${r.topic}". Ask me anything about this research \u2014 I have the full report in context.`, ts:Date.now() });
   tab = "chat"; render();
 };
+window.reextractFacts = async id => {
+  const r = reports.find(x=>x.id===id); if(!r) return;
+  if(!settings.apiKey){ alert("Add your Anthropic API key in Settings first."); return; }
+  if(!navigator.onLine){ alert("Re-extracting needs an internet connection."); return; }
+  research = { running:true, log:[], report:r };
+  renderTab();
+  try{
+    rlog(`Re-extracting offline facts from "${r.topic}"…`);
+    const n = await extractReportFacts(r, rlog);
+    r.factCount = (r.factCount||0) + n;
+    save(LS.reports, reports);
+    rlog(n ? `Done — ${n} new facts stored. Ask about this offline now.`
+           : "No new facts stored (already present, or extraction returned nothing).");
+  }catch(e){ rlog("Failed: "+e.message); }
+  research.running = false; renderTab();
+};
 window.closeReport = () => { research = { running:false, log:[], report:null }; renderTab(); };
 window.deleteReport = id => {
   if(!confirm("Delete this report? (Facts already saved to your knowledge base stay.)")) return;
@@ -1444,9 +1578,27 @@ window.saveSettings = () => {
   if($("setSecret")) settings.proxySecret = $("setSecret").value.trim();
   settings.webllmModel = $("setModel") ? $("setModel").value : settings.webllmModel;
   settings.ttsRate = parseFloat($("setRate")?.value||"1.0");
+  if($("setVoice")) settings.ttsVoice = $("setVoice").value;
+  if($("setPitch")) settings.ttsPitch = parseFloat($("setPitch").value||"1.0");
   save(LS.settings, settings);
   const el = $("modelStatus"); if(el) el.textContent = "Saved ✓";
   render();
+};
+window.refreshVoices = () => {
+  loadVoices();
+  // iOS often only populates the list after a first utterance
+  if(!voiceList.length){ try{ speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); }catch(e){} }
+  setTimeout(()=>{ loadVoices(); renderTab(); }, 350);
+};
+window.previewVoice = () => {
+  const sel = $("setVoice"); if(sel) settings.ttsVoice = sel.value;
+  if($("setRate")) settings.ttsRate = parseFloat($("setRate").value||"1.0");
+  if($("setPitch")) settings.ttsPitch = parseFloat($("setPitch").value||"1.0");
+  save(LS.settings, settings);
+  const was = settings.tts; settings.tts = true;
+  speak("This is how I'll read your answers. Adjust the voice, speed and pitch until it sounds right.");
+  settings.tts = was;
+  setTimeout(()=>{ if(!voiceList.length){ loadVoices(); if(voiceList.length) renderTab(); } }, 400);
 };
 window.toggleTTS = () => { settings.tts = !settings.tts; save(LS.settings, settings); renderTab(); };
 window.newChat = () => { if(busy) return; startSession(); tab="chat"; render(); };
